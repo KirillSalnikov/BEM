@@ -168,10 +168,11 @@ if __name__ == "__main__":
             # At θ=0: S1=S2, so ADDA s11(0) = |S1(0)|²/k² = 2*M11(0)
             # Actually let's check the scale factor by comparing forward values
             if adda is not None:
-                # ADDA s11 normalization: ADDA outputs s11 = (|S2|²+|S1|²)/2 in some units
-                # Let's find scale by matching at θ=0
-                scale = mie['M11'][0] / adda['s11'][0] if adda['s11'][0] > 0 else 1.0
-                print(f"  ADDA/Mie scale factor at θ=0: {scale:.6f}")
+                # ADDA outputs S_ij without dividing by k².
+                # BEM/Mie use M_ij = S_ij / k² (differential cross section).
+                # So the conversion factor is 1/k_ext² = 1/ka².
+                scale = 1.0 / k_ext**2
+                print(f"  ADDA→BEM scale factor: 1/ka² = {scale:.6f}")
                 adda_M11 = adda['s11'] * scale
                 adda_M12 = adda['s12'] * scale
                 adda_M33 = adda['s33'] * scale
