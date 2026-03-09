@@ -1446,6 +1446,17 @@ def orientation_average_mueller(rwg, verts, tris, k_ext, eta_ext, theta_arr,
     total = n_alpha * n_beta * n_gamma
     count = 0
 
+    # Precompute lab-frame vectors for each scattering angle θ.
+    # Lab scattering plane is xz: k_lab = ẑ, r̂_lab = (sinθ, 0, cosθ).
+    # Incident: par=x̂, perp=ŷ. Scattered: par=ê_θ, perp=ê_φ=ŷ.
+    r_hat_lab = np.zeros((ntheta, 3))
+    e_theta_lab = np.zeros((ntheta, 3))
+    e_phi_lab = np.array([0., 1., 0.])
+    for it, th in enumerate(theta_arr):
+        ct, st = np.cos(th), np.sin(th)
+        r_hat_lab[it] = [st, 0., ct]
+        e_theta_lab[it] = [ct, 0., -st]
+
     for ia, alpha in enumerate(alpha_nodes):
         for ib in range(n_beta):
             beta = beta_nodes[ib]
@@ -1455,44 +1466,33 @@ def orientation_average_mueller(rwg, verts, tris, k_ext, eta_ext, theta_arr,
                 if count % 10 == 1 or count == total:
                     print(f"    Orientation {count}/{total}...", flush=True)
 
-                # Rotation: particle rotated by R ↔ incident direction k_hat = R^T ẑ
+                # Rotation R: particle rotated by R in lab ↔ incident rotated by R^T in body
                 R = _euler_rotation(alpha, beta, gamma)
-                k_hat = R.T @ np.array([0., 0., 1.])
+                RT = R.T
+                k_hat = RT @ np.array([0., 0., 1.])
 
-                # Scattering plane basis (lab frame):
-                # e_par in scattering plane (contains k_hat), e_perp perpendicular
-                if abs(k_hat[2]) > 0.999:
-                    e_perp_lab = np.array([0., 1., 0.])
-                else:
-                    e_perp_lab = np.cross(k_hat, np.array([0., 0., 1.]))
-                    e_perp_lab /= np.linalg.norm(e_perp_lab)
-                e_par_lab = np.cross(e_perp_lab, k_hat)
-                e_par_lab /= np.linalg.norm(e_par_lab)
+                # Lab-frame polarizations rotated to body frame
+                e_par_inc = RT @ np.array([1., 0., 0.])   # x̂ rotated
+                e_perp_inc = RT @ np.array([0., 1., 0.])   # ŷ rotated
 
-                # Solve for two polarizations
+                # Solve for two polarizations (lab par = x̂, lab perp = ŷ)
                 solutions = {}
-                for pol_name, E0 in [('par', e_par_lab), ('perp', e_perp_lab)]:
+                for pol_name, E0 in [('par', e_par_inc), ('perp', e_perp_inc)]:
                     b = compute_rhs_planewave(rwg, verts, tris, k_ext, eta_ext,
                                                E0=E0, k_hat=k_hat, quad_order=quad_order)
                     coeffs = lu_solve(Z_lu, b)
                     solutions[pol_name] = (coeffs[:N], coeffs[N:])
 
-                # For each scattering angle θ_sca, observation direction:
-                # r̂ is at angle θ_sca from k_hat, in the scattering plane
                 S1 = np.zeros(ntheta, dtype=complex)
                 S2 = np.zeros(ntheta, dtype=complex)
                 S3 = np.zeros(ntheta, dtype=complex)
                 S4 = np.zeros(ntheta, dtype=complex)
 
                 for it, theta_sca in enumerate(theta_arr):
-                    # Observation direction: rotate k_hat by θ_sca in scattering plane
-                    ct, st = np.cos(theta_sca), np.sin(theta_sca)
-                    r_hat = ct * k_hat + st * e_par_lab
-
-                    # Scattered polarization basis at r̂:
-                    # e_sca_par in scattering plane, perpendicular to r̂
-                    e_sca_par = -st * k_hat + ct * e_par_lab
-                    e_sca_perp = e_perp_lab  # perpendicular stays the same
+                    # Lab-frame observation and polarization, rotated to body frame
+                    r_hat = RT @ r_hat_lab[it]
+                    e_sca_par = RT @ e_theta_lab[it]
+                    e_sca_perp = RT @ e_phi_lab
 
                     # Compute F vector for each incident polarization
                     for pol_name in ['par', 'perp']:
@@ -1501,8 +1501,8 @@ def orientation_average_mueller(rwg, verts, tris, k_ext, eta_ext, theta_arr,
                                                      k_ext, eta_ext, r_hat,
                                                      sM=sM, quad_order=quad_order,
                                                      _cache=ff_cache)
-                        F_par = np.dot(Fv, e_sca_par)   # parallel component
-                        F_perp = np.dot(Fv, e_sca_perp)  # perpendicular component
+                        F_par = np.dot(Fv, e_sca_par)
+                        F_perp = np.dot(Fv, e_sca_perp)
 
                         ik = -1j * k_ext
                         if pol_name == 'par':
@@ -1567,7 +1567,17 @@ def orientation_average_mueller_batched(rwg, verts, tris, k_ext, eta_ext, theta_
     print(f"    Batched: building {total*2} RHS vectors...")
 
     # Store orientation metadata for far-field computation later
-    orientations = []  # list of (k_hat, e_par_lab, e_perp_lab, weight)
+    orientations = []  # list of (RT, weight) — RT = R^T rotation matrix
+
+    # Precompute lab-frame vectors for each scattering angle θ.
+    # Lab scattering plane is xz: k_lab = ẑ, r̂_lab = (sinθ, 0, cosθ).
+    r_hat_lab = np.zeros((ntheta, 3))
+    e_theta_lab = np.zeros((ntheta, 3))
+    e_phi_lab = np.array([0., 1., 0.])
+    for it, th in enumerate(theta_arr):
+        ct, st = np.cos(th), np.sin(th)
+        r_hat_lab[it] = [st, 0., ct]
+        e_theta_lab[it] = [ct, 0., -st]
 
     # Build RHS matrix: columns are [b_par_0, b_perp_0, b_par_1, b_perp_1, ...]
     B = np.zeros((2*N, total*2), dtype=complex)
@@ -1578,26 +1588,22 @@ def orientation_average_mueller_batched(rwg, verts, tris, k_ext, eta_ext, theta_
             w_beta = mu_weights[ib]
             for ig, gamma in enumerate(gamma_nodes):
                 R = _euler_rotation(alpha, beta, gamma)
-                k_hat = R.T @ np.array([0., 0., 1.])
+                RT = R.T
+                k_hat = RT @ np.array([0., 0., 1.])
 
-                # Scattering plane basis
-                if abs(k_hat[2]) > 0.999:
-                    e_perp_lab = np.array([0., 1., 0.])
-                else:
-                    e_perp_lab = np.cross(k_hat, np.array([0., 0., 1.]))
-                    e_perp_lab /= np.linalg.norm(e_perp_lab)
-                e_par_lab = np.cross(e_perp_lab, k_hat)
-                e_par_lab /= np.linalg.norm(e_par_lab)
+                # Lab-frame polarizations rotated to body frame
+                e_par_inc = RT @ np.array([1., 0., 0.])
+                e_perp_inc = RT @ np.array([0., 1., 0.])
 
                 weight = d_alpha * w_beta * d_gamma / (8 * np.pi**2)
-                orientations.append((k_hat, e_par_lab, e_perp_lab, weight))
+                orientations.append((RT, weight))
 
-                # Compute RHS for both polarizations
+                # Compute RHS for both polarizations (lab par = x̂, lab perp = ŷ)
                 B[:, col]   = compute_rhs_planewave(rwg, verts, tris, k_ext, eta_ext,
-                                                     E0=e_par_lab, k_hat=k_hat,
+                                                     E0=e_par_inc, k_hat=k_hat,
                                                      quad_order=quad_order)
                 B[:, col+1] = compute_rhs_planewave(rwg, verts, tris, k_ext, eta_ext,
-                                                     E0=e_perp_lab, k_hat=k_hat,
+                                                     E0=e_perp_inc, k_hat=k_hat,
                                                      quad_order=quad_order)
                 col += 2
 
@@ -1613,7 +1619,7 @@ def orientation_average_mueller_batched(rwg, verts, tris, k_ext, eta_ext, theta_
         if (ori_idx+1) % 10 == 1 or (ori_idx+1) == total:
             print(f"    Orientation {ori_idx+1}/{total}...", flush=True)
 
-        k_hat, e_par_lab, e_perp_lab, weight = orientations[ori_idx]
+        RT, weight = orientations[ori_idx]
 
         # Extract solutions for par and perp polarizations
         J_par  = X[:N, ori_idx*2]
@@ -1627,10 +1633,10 @@ def orientation_average_mueller_batched(rwg, verts, tris, k_ext, eta_ext, theta_
         S4 = np.zeros(ntheta, dtype=complex)
 
         for it, theta_sca in enumerate(theta_arr):
-            ct, st = np.cos(theta_sca), np.sin(theta_sca)
-            r_hat = ct * k_hat + st * e_par_lab
-            e_sca_par = -st * k_hat + ct * e_par_lab
-            e_sca_perp = e_perp_lab
+            # Lab-frame observation and polarization, rotated to body frame
+            r_hat = RT @ r_hat_lab[it]
+            e_sca_par = RT @ e_theta_lab[it]
+            e_sca_perp = RT @ e_phi_lab
 
             for pol_name, J, M_c in [('par', J_par, M_par), ('perp', J_perp, M_perp)]:
                 Fv = _compute_far_field_vec(rwg, verts, tris, J, M_c,
