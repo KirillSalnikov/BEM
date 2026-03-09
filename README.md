@@ -16,101 +16,162 @@ No further installation needed — just place `bem_core.py` in your project and 
 from bem_core import icosphere, build_rwg, assemble_L_K, assemble_pmchwt, ...
 ```
 
+## Parameters
+
+### Physical Parameters
+
+| Parameter | Symbol | Formula | Description |
+|---|---|---|---|
+| `k_ext` | k | 2π/λ | Exterior wavenumber |
+| `k_int` | k·m | `k_ext * m_rel` | Interior wavenumber |
+| `eta_ext` | η | 1.0 (normalized) or 377 Ω | Exterior wave impedance |
+| `eta_int` | η/m | `eta_ext / m_rel` | Interior wave impedance |
+| `m_rel` | m | n + iκ | Complex refractive index (real → transparent, imag → absorbing) |
+| `radius` | R | — | Particle radius (for cross-section normalization by πR²) |
+| `ka` | ka | `k_ext * radius` | Size parameter (mesh density depends on this) |
+
+### Mesh Parameters
+
+| Parameter | Value | Triangles | RWG basis | Recommended for |
+|---|---|---|---|---|
+| `refinements=1` | coarse | 80 | 120 | Quick tests, ka < 0.5 |
+| `refinements=2` | medium | 320 | 480 | ka ≈ 1, ~5% error |
+| `refinements=3` | fine | 1280 | 1920 | ka ≈ 1–3, ~1% error |
+| `refinements=4` | very fine | 5120 | 7680 | ka ≈ 3–6, <1% error |
+
+Rule of thumb: need ~10 elements per wavelength → `refinements ≈ ceil(log4(10·ka²))`.
+
+### Solver Parameters
+
+| Parameter | Default | Description |
+|---|---|---|
+| `quad_order` | 7 | Triangle quadrature (1, 3, or 7 points). 7 recommended |
+| `sM` | −1 | Far-field sign: −1 for PMCHWT (dielectric), +1 for PEC |
+| `tol` (GMRES) | 1e-6 | Relative residual tolerance |
+| `maxiter` (GMRES) | 200 | Maximum GMRES iterations |
+
 ## Quick Start
 
-### Arbitrary Shape from File
-
-```python
-from bem_core import load_mesh, build_rwg, assemble_pmchwt, compute_rhs_planewave
-import numpy as np
-
-# Load mesh from STL, OBJ, or Gmsh .msh file
-verts, tris = load_mesh("particle.stl")  # or .obj, .msh
-rwg = build_rwg(verts, tris)
-
-# Set up physics
-k_ext = 2*np.pi / wavelength
-m_rel = 1.5  # refractive index
-k_int = k_ext * m_rel
-eta_ext = 1.0; eta_int = eta_ext / m_rel
-
-# Assemble and solve
-Z, _, _ = assemble_pmchwt(rwg, verts, tris, k_ext, k_int, eta_ext, eta_int)
-b = compute_rhs_planewave(rwg, verts, tris, k_ext, eta_ext)
-coeffs = np.linalg.solve(Z, b)
-```
-
-The mesh must be a **closed** triangular surface (no boundary edges). You can generate meshes with [Gmsh](https://gmsh.info/), [MeshLab](https://meshlab.net/), or any CAD tool that exports STL/OBJ.
-
-### PEC Sphere (EFIE)
-
-```python
-import numpy as np
-from bem_core import (icosphere, build_rwg, tri_quadrature,
-                      assemble_L_K, compute_far_field, compute_cross_sections)
-
-radius = 1.0; k = 2*np.pi; eta = 377.0
-E0 = np.array([1, 0, 0]); k_hat = np.array([0, 0, 1])
-
-# Mesh and basis
-verts, tris = icosphere(radius, refinements=3)
-rwg = build_rwg(verts, tris)
-N = rwg['N']
-
-# Assemble L operator
-L, K_op = assemble_L_K(rwg, verts, tris, k)
-
-# RHS (plane wave excitation)
-quad_pts, quad_wts = tri_quadrature(7)
-lam0 = 1 - quad_pts[:,0] - quad_pts[:,1]
-def get_qpts(ti):
-    t = tris[ti]; v0 = verts[t[:,0]]; v1 = verts[t[:,1]]; v2 = verts[t[:,2]]
-    return (np.einsum('q,ni->nqi', lam0, v0) +
-            np.einsum('q,ni->nqi', quad_pts[:,0], v1) +
-            np.einsum('q,ni->nqi', quad_pts[:,1], v2))
-qp = get_qpts(rwg['tri_p']); qm = get_qpts(rwg['tri_m'])
-V_E = np.zeros(N, dtype=complex)
-for qpts, free, area, sign in [(qp, rwg['free_p'], rwg['area_p'], +1),
-                                 (qm, rwg['free_m'], rwg['area_m'], -1)]:
-    f = sign * (rwg['length'][:,None,None] / (2*area[:,None,None])) * (qpts - free[:,None,:])
-    jw = area[:,None] * quad_wts[None,:]
-    phase = np.exp(1j * k * np.einsum('i,nqi->nq', k_hat, qpts))
-    V_E += np.sum(np.einsum('nqi,i->nq', f, E0) * phase * jw, axis=1)
-
-# Solve EFIE: η·L·J = V_E
-J = np.linalg.solve(eta * L, V_E)
-M = np.zeros(N, dtype=complex)
-
-# Cross sections
-Q_ext, Q_sca = compute_cross_sections(rwg, verts, tris, J, M, k, eta, radius)
-print(f"Q_ext = {Q_ext:.4f}, Q_sca = {Q_sca:.4f}")
-```
-
-### Dielectric Sphere (PMCHWT)
+### 1. Dielectric Sphere — Cross Sections
 
 ```python
 import numpy as np
 from bem_core import (icosphere, build_rwg, assemble_pmchwt,
                       compute_rhs_planewave, compute_cross_sections)
 
-radius = 1.0; k_ext = 2*np.pi; eta_ext = 377.0
-m_rel = 1.5  # relative refractive index
-k_int = k_ext * m_rel; eta_int = eta_ext / m_rel
+# --- Parameters ---
+radius = 1.0           # sphere radius
+m_rel = 1.5            # refractive index
+k_ext = 2.0            # wavenumber (ka = 2.0)
+k_int = k_ext * m_rel
+eta_ext = 1.0;  eta_int = eta_ext / m_rel
+refinements = 3        # 1280 triangles, 1920 RWG
 
-verts, tris = icosphere(radius, refinements=3)
+# --- Mesh & solve ---
+verts, tris = icosphere(radius, refinements)
 rwg = build_rwg(verts, tris)
-N = rwg['N']
-
-# Assemble PMCHWT system
 Z = assemble_pmchwt(rwg, verts, tris, k_ext, k_int, eta_ext, eta_int)
 b = compute_rhs_planewave(rwg, verts, tris, k_ext, eta_ext)
-
-# Solve
 coeffs = np.linalg.solve(Z, b)
-J = coeffs[:N]; M = coeffs[N:]
+J, M = coeffs[:rwg['N']], coeffs[rwg['N']:]
 
-# Cross sections (sM=-1 for PMCHWT convention)
+# --- Results ---
 Q_ext, Q_sca = compute_cross_sections(rwg, verts, tris, J, M, k_ext, eta_ext, radius, sM=-1)
+print(f"Q_ext = {Q_ext:.4f}, Q_sca = {Q_sca:.4f}")
+```
+
+### 2. Dielectric Sphere — Mueller Matrix
+
+```python
+import numpy as np
+from scipy.linalg import lu_factor
+from bem_core import (icosphere, build_rwg, assemble_pmchwt,
+                      compute_mueller_matrix)
+
+# --- Parameters ---
+radius = 1.0;  m_rel = 1.5
+k_ext = 2.0;  k_int = k_ext * m_rel
+eta_ext = 1.0; eta_int = eta_ext / m_rel
+
+# --- Mesh & matrix ---
+verts, tris = icosphere(radius, refinements=3)
+rwg = build_rwg(verts, tris)
+Z = assemble_pmchwt(rwg, verts, tris, k_ext, k_int, eta_ext, eta_int)
+Z_lu = lu_factor(Z)  # factorize once, reuse for 2 polarizations
+
+# --- Mueller matrix vs scattering angle ---
+theta = np.linspace(0.01, np.pi - 0.01, 181)
+M = compute_mueller_matrix(rwg, verts, tris, k_ext, eta_ext, theta, Z_lu=Z_lu, sM=-1)
+# M[i,j,:] — 4x4 Mueller matrix at each angle, normalized by 1/k²
+# M[0,0,:] = differential scattering cross section for unpolarized light
+```
+
+### 3. Orientation-Averaged Mueller Matrix
+
+```python
+from bem_core import orientation_average_mueller
+
+# Same setup as above, then:
+M_avg = orientation_average_mueller(rwg, verts, tris, k_ext, eta_ext, theta,
+                                     Z_lu=Z_lu, sM=-1,
+                                     n_alpha=16, n_beta=8, n_gamma=8)
+# 16×8×8 = 1024 orientations, 2 solves each → 2048 back-substitutions
+```
+
+### 4. Arbitrary Shape from File
+
+```python
+from bem_core import load_mesh, build_rwg, assemble_pmchwt, compute_rhs_planewave
+import numpy as np
+
+verts, tris = load_mesh("particle.stl")  # also .obj, .msh (Gmsh v2/v4)
+rwg = build_rwg(verts, tris)
+
+k_ext = 2*np.pi / wavelength
+m_rel = 1.5 + 0.01j   # complex m → absorbing particle
+k_int = k_ext * m_rel
+eta_ext = 1.0;  eta_int = eta_ext / m_rel
+
+Z = assemble_pmchwt(rwg, verts, tris, k_ext, k_int, eta_ext, eta_int)
+b = compute_rhs_planewave(rwg, verts, tris, k_ext, eta_ext)
+coeffs = np.linalg.solve(Z, b)
+```
+
+The mesh must be a **closed** triangular surface (no boundary edges). Generate with [Gmsh](https://gmsh.info/), [MeshLab](https://meshlab.net/), or any CAD tool exporting STL/OBJ.
+
+### 5. OpenCL-Accelerated Solve (GPU/CPU)
+
+```python
+from bem_opencl import assemble_pmchwt_ocl, solve_gmres_ocl
+from bem_core import compute_rhs_planewave
+
+# Same parameters as above
+Z = assemble_pmchwt_ocl(rwg, verts, tris, k_ext, k_int, eta_ext, eta_int)
+b = compute_rhs_planewave(rwg, verts, tris, k_ext, eta_ext)
+coeffs = solve_gmres_ocl(Z, b, tol=1e-6, maxiter=200)
+```
+
+### 6. PEC Sphere (EFIE)
+
+```python
+import numpy as np
+from bem_core import (icosphere, build_rwg, assemble_L_K,
+                      compute_rhs_planewave, compute_cross_sections)
+
+radius = 1.0;  k = 2.0;  eta = 1.0
+verts, tris = icosphere(radius, refinements=3)
+rwg = build_rwg(verts, tris)
+
+L, K_op = assemble_L_K(rwg, verts, tris, k)
+
+# For PEC, only V_E part of RHS is needed
+b = compute_rhs_planewave(rwg, verts, tris, k, eta)
+V_E = b[:rwg['N']]
+
+J = np.linalg.solve(eta * L, V_E)
+M = np.zeros(rwg['N'], dtype=complex)
+
+Q_ext, Q_sca = compute_cross_sections(rwg, verts, tris, J, M, k, eta, radius, sM=+1)
 print(f"Q_ext = {Q_ext:.4f}, Q_sca = {Q_sca:.4f}")
 ```
 
