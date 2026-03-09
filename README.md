@@ -57,16 +57,28 @@ from bem_core import icosphere, build_rwg, assemble_L_K, assemble_pmchwt, ...
 | `refinements=3` | fine | 1280 | 1920 | ka ≈ 1–3, ~1% error |
 | `refinements=4` | very fine | 5120 | 7680 | ka ≈ 3–6, <1% error |
 
-Rule of thumb: need ~10 elements per wavelength → `refinements ≈ ceil(log4(10·ka²))`.
+Rule of thumb: need ~10 elements per wavelength → `refinements ≈ ceil(log4(30·ka²))`.
+
+Short version: **ref=2 for ka ≤ 1, ref=3 for ka ≤ 3, ref=4 for ka ≤ 6, ref=5 for ka ≤ 12**.
 
 ### Solver Parameters
 
 | Parameter | Default | Description |
 |---|---|---|
-| `quad_order` | 7 | Triangle quadrature points. Supported: 1 (1 pt), 3 (3 pts), 7 (7 pts, degree 5), 13 (13 pts, degree 7), 25 (25 pts, degree 10) |
+| `quad_order` | 7 | Triangle quadrature points (see table below) |
 | `sM` | −1 | Far-field sign: −1 for PMCHWT (dielectric), +1 for PEC |
 | `tol` (GMRES) | 1e-6 | Relative residual tolerance |
 | `maxiter` (GMRES) | 200 | Maximum GMRES iterations |
+
+### Quadrature Order Selection
+
+| `quad_order` | Points | Degree | When to use |
+|---|---|---|---|
+| 7 | 7 | 5 | **Default.** Sufficient for ka ≤ 3 |
+| 13 | 13 | 7 | ka = 3–6, or when higher accuracy needed |
+| 25 | 25 | 10 | ka > 6, or precision < 0.1% required |
+
+For most problems, **quad_order=7 is sufficient** — the error is dominated by mesh resolution, not quadrature. Increasing quad_order only helps when the mesh is already fine enough.
 
 ## Quick Start
 
