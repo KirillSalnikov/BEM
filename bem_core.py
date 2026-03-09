@@ -1520,6 +1520,141 @@ def orientation_average_mueller(rwg, verts, tris, k_ext, eta_ext, theta_arr,
     return M_avg
 
 
+def orientation_average_mueller_batched(rwg, verts, tris, k_ext, eta_ext, theta_arr,
+                                         Z_lu=None, Z=None, sM=-1, quad_order=7,
+                                         n_alpha=8, n_beta=8, n_gamma=1):
+    """Compute orientation-averaged Mueller matrix ⟨M(θ)⟩ — batched RHS version.
+
+    Same as orientation_average_mueller but batches ALL RHS vectors into a single
+    matrix and solves them with one lu_solve call, exploiting LAPACK's optimized
+    multi-RHS triangular solve (dtrsm). This is significantly faster because:
+      - LAPACK's dtrsm is optimized for multi-RHS (cache-friendly BLAS-3)
+      - Eliminates Python loop overhead for the solve step
+
+    Parameters and returns are identical to orientation_average_mueller.
+    """
+    from scipy.linalg import lu_factor, lu_solve
+    from scipy.special import roots_legendre
+
+    N = rwg['N']
+    ntheta = len(theta_arr)
+
+    if Z_lu is None:
+        if Z is None:
+            raise ValueError("Provide either Z or Z_lu")
+        Z_lu = lu_factor(Z)
+
+    # Precompute quadrature points for far field
+    quad_pts, quad_wts = tri_quadrature(quad_order)
+    lam0 = 1 - quad_pts[:,0] - quad_pts[:,1]
+    def get_qpts(ti):
+        t = tris[ti]; v0 = verts[t[:,0]]; v1 = verts[t[:,1]]; v2 = verts[t[:,2]]
+        return np.einsum('q,ni->nqi', lam0, v0) + np.einsum('q,ni->nqi', quad_pts[:,0], v1) + \
+               np.einsum('q,ni->nqi', quad_pts[:,1], v2)
+    ff_cache = {'qp': get_qpts(rwg['tri_p']), 'qm': get_qpts(rwg['tri_m'])}
+
+    # Quadrature nodes
+    mu_nodes, mu_weights = roots_legendre(n_beta)
+    beta_nodes = np.arccos(mu_nodes)
+    alpha_nodes = np.linspace(0, 2*np.pi, n_alpha, endpoint=False)
+    d_alpha = 2*np.pi / n_alpha
+    gamma_nodes = np.linspace(0, 2*np.pi, n_gamma, endpoint=False)
+    d_gamma = 2*np.pi / n_gamma
+
+    total = n_alpha * n_beta * n_gamma
+
+    # --- Phase 1: Pre-compute ALL rotated RHS vectors ---
+    print(f"    Batched: building {total*2} RHS vectors...")
+
+    # Store orientation metadata for far-field computation later
+    orientations = []  # list of (k_hat, e_par_lab, e_perp_lab, weight)
+
+    # Build RHS matrix: columns are [b_par_0, b_perp_0, b_par_1, b_perp_1, ...]
+    B = np.zeros((2*N, total*2), dtype=complex)
+    col = 0
+    for ia, alpha in enumerate(alpha_nodes):
+        for ib in range(n_beta):
+            beta = beta_nodes[ib]
+            w_beta = mu_weights[ib]
+            for ig, gamma in enumerate(gamma_nodes):
+                R = _euler_rotation(alpha, beta, gamma)
+                k_hat = R.T @ np.array([0., 0., 1.])
+
+                # Scattering plane basis
+                if abs(k_hat[2]) > 0.999:
+                    e_perp_lab = np.array([0., 1., 0.])
+                else:
+                    e_perp_lab = np.cross(k_hat, np.array([0., 0., 1.]))
+                    e_perp_lab /= np.linalg.norm(e_perp_lab)
+                e_par_lab = np.cross(e_perp_lab, k_hat)
+                e_par_lab /= np.linalg.norm(e_par_lab)
+
+                weight = d_alpha * w_beta * d_gamma / (8 * np.pi**2)
+                orientations.append((k_hat, e_par_lab, e_perp_lab, weight))
+
+                # Compute RHS for both polarizations
+                B[:, col]   = compute_rhs_planewave(rwg, verts, tris, k_ext, eta_ext,
+                                                     E0=e_par_lab, k_hat=k_hat,
+                                                     quad_order=quad_order)
+                B[:, col+1] = compute_rhs_planewave(rwg, verts, tris, k_ext, eta_ext,
+                                                     E0=e_perp_lab, k_hat=k_hat,
+                                                     quad_order=quad_order)
+                col += 2
+
+    # --- Phase 2: Single batched solve ---
+    print(f"    Batched: solving {total*2} RHS at once...")
+    X = lu_solve(Z_lu, B)
+
+    # --- Phase 3: Far-field and Mueller matrix accumulation ---
+    print(f"    Batched: computing far-field for {total} orientations...")
+    M_avg = np.zeros((4, 4, ntheta))
+
+    for ori_idx in range(total):
+        if (ori_idx+1) % 10 == 1 or (ori_idx+1) == total:
+            print(f"    Orientation {ori_idx+1}/{total}...", flush=True)
+
+        k_hat, e_par_lab, e_perp_lab, weight = orientations[ori_idx]
+
+        # Extract solutions for par and perp polarizations
+        J_par  = X[:N, ori_idx*2]
+        M_par  = X[N:, ori_idx*2]
+        J_perp = X[:N, ori_idx*2+1]
+        M_perp = X[N:, ori_idx*2+1]
+
+        S1 = np.zeros(ntheta, dtype=complex)
+        S2 = np.zeros(ntheta, dtype=complex)
+        S3 = np.zeros(ntheta, dtype=complex)
+        S4 = np.zeros(ntheta, dtype=complex)
+
+        for it, theta_sca in enumerate(theta_arr):
+            ct, st = np.cos(theta_sca), np.sin(theta_sca)
+            r_hat = ct * k_hat + st * e_par_lab
+            e_sca_par = -st * k_hat + ct * e_par_lab
+            e_sca_perp = e_perp_lab
+
+            for pol_name, J, M_c in [('par', J_par, M_par), ('perp', J_perp, M_perp)]:
+                Fv = _compute_far_field_vec(rwg, verts, tris, J, M_c,
+                                             k_ext, eta_ext, r_hat,
+                                             sM=sM, quad_order=quad_order,
+                                             _cache=ff_cache)
+                F_par = np.dot(Fv, e_sca_par)
+                F_perp = np.dot(Fv, e_sca_perp)
+
+                ik = -1j * k_ext
+                if pol_name == 'par':
+                    S2[it] = ik * F_par
+                    S4[it] = ik * F_perp
+                else:
+                    S3[it] = ik * F_par
+                    S1[it] = ik * F_perp
+
+        M_orient = amplitude_to_mueller(S1, S2, S3, S4) / k_ext**2
+        M_avg += weight * M_orient
+
+    print(f"    Batched: averaged over {total} orientations.")
+    return M_avg
+
+
 # ============================================================
 # 10. SNC-tested assembly (n̂×RWG test functions)
 # ============================================================
@@ -2139,4 +2274,345 @@ def solve_hmatrix_gmres(Z_hmat, b, tol=1e-6, maxiter=200, Z_diag_blocks=None):
     x, info = gmres(A, b, rtol=tol, maxiter=maxiter, M=precond,
                      callback=callback, callback_type='pr_norm')
     print(f"  H-matrix GMRES: {iters[0]} iterations, info={info}")
+    return x
+
+
+# ============================================================
+# FMM-accelerated matrix-vector product
+# ============================================================
+
+class _OctreeNode:
+    """Single node in the octree."""
+    __slots__ = ('center', 'half_size', 'indices', 'children',
+                 'level', 'is_leaf', 'idx')
+
+    def __init__(self, center, half_size, indices, level, idx):
+        self.center = center
+        self.half_size = half_size
+        self.indices = indices
+        self.children = []
+        self.level = level
+        self.is_leaf = True
+        self.idx = idx
+
+
+class FMMOperator:
+    """FMM-accelerated matrix-vector product for the PMCHWT system.
+
+    Uses an octree to partition RWG basis function centroids.
+    Near-field interactions are computed with dense blocks;
+    far-field interactions use SVD-compressed low-rank approximations.
+
+    Parameters
+    ----------
+    rwg : dict
+        RWG basis function data from build_rwg().
+    verts : ndarray (V, 3)
+        Mesh vertices.
+    tris : ndarray (T, 3)
+        Mesh triangles.
+    k : float
+        Wavenumber (exterior).
+    eta : float
+        Wave impedance (exterior).
+    L : ndarray (N, N)
+        Pre-assembled L operator matrix.
+    K : ndarray (N, N)
+        Pre-assembled K operator matrix.
+    N : int
+        Number of RWG basis functions.
+    tree_depth : int
+        Maximum octree depth.
+    p_order : int
+        Reserved for future spherical harmonics order.
+    admissibility : float
+        Admissibility parameter: a block is far-field if
+        dist(centers) > admissibility * max(diam_row, diam_col).
+    aca_tol : float
+        Tolerance for SVD compression of far-field blocks.
+    max_rank : int
+        Maximum rank for low-rank approximations.
+    """
+
+    def __init__(self, rwg, verts, tris, k, eta, L, K, N,
+                 tree_depth=4, p_order=6, admissibility=2.0,
+                 aca_tol=1e-4, max_rank=50, Z_full=None):
+        import time
+        t0 = time.time()
+        self.N_rwg = N
+        self.M = 2 * N  # PMCHWT system size
+        self.k = k
+        self.eta_val = eta
+        self.dtype = np.complex128
+
+        # Store full Z matrix for direct block extraction
+        self._Z = Z_full
+        self._L = L
+        self._K = K
+        self._aca_tol = aca_tol
+        self._max_rank = max_rank
+        self._admissibility = admissibility
+
+        # Compute RWG centroids
+        centroids = np.zeros((N, 3))
+        for n in range(N):
+            tp = rwg['tri_p'][n]
+            tm = rwg['tri_m'][n]
+            cp = verts[tris[tp]].mean(axis=0)
+            cm = verts[tris[tm]].mean(axis=0)
+            centroids[n] = 0.5 * (cp + cm)
+        self._centroids = centroids
+
+        # Build octree
+        leaf_size = max(16, N // (4 ** min(tree_depth, 4)))
+        self._leaves = []
+        self._all_nodes = []
+        self._root = self._build_octree(centroids, np.arange(N),
+                                         tree_depth, leaf_size)
+
+        n_leaves = len(self._leaves)
+        print(f"  FMM octree: {len(self._all_nodes)} nodes, "
+              f"{n_leaves} leaves, max depth={tree_depth}, "
+              f"leaf_size<={leaf_size}")
+
+        # Build interaction lists (near-field and far-field leaf pairs)
+        self._near_blocks = []  # list of (row_idx, col_idx, dense_block)
+        self._far_blocks = []   # list of (row_idx, col_idx, U, V)
+        self._build_interaction_lists()
+
+        # Statistics
+        dense_entries = sum(b[2].shape[0] * b[2].shape[1]
+                           for b in self._near_blocks)
+        lr_entries = sum(b[2].shape[0] * b[2].shape[1] +
+                        b[3].shape[0] * b[3].shape[1]
+                        for b in self._far_blocks)
+        total = (2 * N) ** 2
+        ratio = (dense_entries + lr_entries) / max(total, 1)
+        n_far = len(self._far_blocks)
+        avg_rank = (np.mean([b[2].shape[1] for b in self._far_blocks])
+                    if n_far > 0 else 0)
+        elapsed = time.time() - t0
+        print(f"  FMM setup: {len(self._near_blocks)} near + "
+              f"{n_far} far blocks, compression {ratio:.1%}, "
+              f"avg rank {avg_rank:.1f}, {elapsed:.1f}s")
+
+    def _build_octree(self, centroids, indices, max_depth, leaf_size):
+        """Build octree by recursive spatial subdivision."""
+        pts = centroids[indices]
+        bbox_min = pts.min(axis=0)
+        bbox_max = pts.max(axis=0)
+        center = 0.5 * (bbox_min + bbox_max)
+        half_size = 0.5 * (bbox_max - bbox_min).max() * 1.01
+
+        root = _OctreeNode(center, half_size, indices, 0, 0)
+        self._all_nodes.append(root)
+        self._subdivide(root, centroids, max_depth, leaf_size)
+        return root
+
+    def _subdivide(self, node, centroids, max_depth, leaf_size):
+        """Recursively subdivide an octree node."""
+        if len(node.indices) <= leaf_size or node.level >= max_depth:
+            self._leaves.append(node)
+            return
+
+        node.is_leaf = False
+        pts = centroids[node.indices]
+        cx, cy, cz = node.center
+        hs = node.half_size * 0.5
+
+        # Assign each point to exactly one octant using
+        # strict comparison on x,y and >= on z to avoid duplicates
+        octant = ((pts[:, 0] >= cx).astype(int) * 4 +
+                  (pts[:, 1] >= cy).astype(int) * 2 +
+                  (pts[:, 2] >= cz).astype(int))
+
+        signs = [(-1, -1, -1), (-1, -1, 1), (-1, 1, -1), (-1, 1, 1),
+                 (1, -1, -1), (1, -1, 1), (1, 1, -1), (1, 1, 1)]
+
+        for oct_id in range(8):
+            mask = (octant == oct_id)
+            child_indices = node.indices[mask]
+            if len(child_indices) == 0:
+                continue
+            sx, sy, sz = signs[oct_id]
+            child_center = np.array([cx + sx * hs,
+                                     cy + sy * hs,
+                                     cz + sz * hs])
+            child = _OctreeNode(child_center, hs, child_indices,
+                                node.level + 1,
+                                len(self._all_nodes))
+            self._all_nodes.append(child)
+            node.children.append(child)
+            self._subdivide(child, centroids, max_depth,
+                            leaf_size)
+
+    def _is_far_field(self, leaf_i, leaf_j):
+        """Check admissibility: are two leaves well-separated?"""
+        dist = np.linalg.norm(leaf_i.center - leaf_j.center)
+        diam_i = leaf_i.half_size * 2
+        diam_j = leaf_j.half_size * 2
+        return dist > self._admissibility * max(diam_i, diam_j, 1e-15)
+
+    def _extract_pmchwt_block(self, row_rwg, col_rwg):
+        """Extract a PMCHWT sub-block for given RWG row/col indices.
+
+        Returns the (2*nr, 2*nc) block of the full PMCHWT matrix.
+        Uses the full Z matrix directly if available, otherwise
+        reconstructs from L and K operators.
+        """
+        N = self.N_rwg
+        nr = len(row_rwg)
+        nc = len(col_rwg)
+
+        if self._Z is not None:
+            # Direct extraction from full matrix
+            row_full = np.concatenate([row_rwg, row_rwg + N])
+            col_full = np.concatenate([col_rwg, col_rwg + N])
+            return self._Z[np.ix_(row_full, col_full)].copy()
+
+        eta = self.eta_val
+        L_rc = self._L[np.ix_(row_rwg, col_rwg)]
+        K_rc = self._K[np.ix_(row_rwg, col_rwg)]
+        block = np.empty((2 * nr, 2 * nc), dtype=np.complex128)
+        block[:nr, :nc] = eta * L_rc
+        block[:nr, nc:] = -K_rc
+        block[nr:, :nc] = K_rc
+        block[nr:, nc:] = L_rc / eta
+        return block
+
+    def _build_interaction_lists(self):
+        """Build near-field (dense) and far-field (low-rank) blocks
+        for all pairs of leaves, operating on the full 2N x 2N system."""
+        N = self.N_rwg
+        n_leaves = len(self._leaves)
+
+        for i in range(n_leaves):
+            leaf_i = self._leaves[i]
+            row_rwg = leaf_i.indices
+            row_idx = np.concatenate([row_rwg, row_rwg + N])
+
+            for j in range(n_leaves):
+                leaf_j = self._leaves[j]
+                col_rwg = leaf_j.indices
+                col_idx = np.concatenate([col_rwg, col_rwg + N])
+
+                if self._is_far_field(leaf_i, leaf_j):
+                    # Far-field: SVD compress
+                    block = self._extract_pmchwt_block(row_rwg, col_rwg)
+                    U_lr, s, Vh = np.linalg.svd(block,
+                                                 full_matrices=False)
+                    # Truncate: keep singular values where s[k]/s[0] > tol
+                    if s[0] > 0:
+                        ratios = s / s[0]
+                        rank = int(np.sum(ratios > self._aca_tol))
+                        rank = max(1, min(rank, self._max_rank))
+                    else:
+                        rank = 1
+                    U_block = U_lr[:, :rank] * s[:rank]
+                    V_block = Vh[:rank, :]
+                    self._far_blocks.append((row_idx, col_idx,
+                                            U_block, V_block))
+                else:
+                    # Near-field: store dense block
+                    block = self._extract_pmchwt_block(row_rwg, col_rwg)
+                    self._near_blocks.append((row_idx, col_idx, block))
+
+    def matvec(self, x):
+        """FMM-accelerated matrix-vector product y = Z*x."""
+        y = np.zeros(self.M, dtype=self.dtype)
+
+        # Near-field: dense matvec
+        for row_idx, col_idx, block in self._near_blocks:
+            y[row_idx] += block @ x[col_idx]
+
+        # Far-field: low-rank matvec
+        for row_idx, col_idx, U, V in self._far_blocks:
+            y[row_idx] += U @ (V @ x[col_idx])
+
+        return y
+
+    def as_linear_operator(self):
+        """Return a scipy LinearOperator for use with GMRES."""
+        from scipy.sparse.linalg import LinearOperator
+        return LinearOperator((self.M, self.M), matvec=self.matvec,
+                              dtype=self.dtype)
+
+    def memory_bytes(self):
+        """Estimate memory usage in bytes."""
+        total = 0
+        for _, _, block in self._near_blocks:
+            total += block.nbytes
+        for _, _, U, V in self._far_blocks:
+            total += U.nbytes + V.nbytes
+        return total
+
+
+def solve_fmm_gmres(rwg, verts, tris, Z, b, k_ext, eta_ext,
+                     tol=1e-6, maxiter=200):
+    """Solve the PMCHWT system using FMM-accelerated GMRES.
+
+    Parameters
+    ----------
+    rwg : dict
+        RWG basis function data.
+    verts : ndarray (V, 3)
+        Mesh vertices.
+    tris : ndarray (T, 3)
+        Mesh triangles.
+    Z : ndarray (2N, 2N)
+        Full PMCHWT system matrix (used to extract L, K operators
+        and build the block-diagonal preconditioner).
+    b : ndarray (2N,)
+        Right-hand side vector.
+    k_ext : float
+        Exterior wavenumber.
+    eta_ext : float
+        Exterior wave impedance.
+    tol : float
+        GMRES convergence tolerance.
+    maxiter : int
+        Maximum number of GMRES iterations.
+
+    Returns
+    -------
+    x : ndarray (2N,) — solution vector
+    """
+    from scipy.sparse.linalg import LinearOperator, gmres
+    import time
+
+    N = rwg['N']
+
+    t0 = time.time()
+    fmm = FMMOperator(rwg, verts, tris, k_ext, eta_ext,
+                       None, None, N, Z_full=Z)
+    print(f"  FMM setup: {time.time() - t0:.2f}s, "
+          f"memory: {fmm.memory_bytes() / 1e6:.1f} MB")
+
+    A = fmm.as_linear_operator()
+
+    # Block-diagonal preconditioner from Z
+    Z_JJ = Z[:N, :N].copy()
+    Z_MM = Z[N:, N:].copy()
+    lu_JJ = linalg.lu_factor(Z_JJ)
+    lu_MM = linalg.lu_factor(Z_MM)
+
+    def precond_matvec(r):
+        y = np.empty(2 * N, dtype=complex)
+        y[:N] = linalg.lu_solve(lu_JJ, r[:N])
+        y[N:] = linalg.lu_solve(lu_MM, r[N:])
+        return y
+
+    precond = LinearOperator((2 * N, 2 * N), matvec=precond_matvec,
+                              dtype=complex)
+
+    iters = [0]
+    def callback(pr_norm):
+        iters[0] += 1
+
+    t0 = time.time()
+    x, info = gmres(A, b, rtol=tol, maxiter=maxiter, M=precond,
+                     callback=callback, callback_type='pr_norm')
+    elapsed = time.time() - t0
+    print(f"  FMM GMRES: {iters[0]} iterations, info={info}, "
+          f"{elapsed:.2f}s")
     return x
