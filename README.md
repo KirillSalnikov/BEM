@@ -2,12 +2,30 @@
 
 Boundary Element Method (BEM) solver for electromagnetic scattering problems on 3D surfaces. Implements the PMCHWT (Poggio–Miller–Chang–Harrington–Wu–Tsai) formulation with RWG (Rao–Wilton–Glisson) basis functions.
 
+## Features
+
+- **PMCHWT + EFIE** formulations for dielectric and PEC scatterers
+- **Adaptive mesh refinement** with red-green closure (`refine_mesh`, `adaptive_refine`)
+- **Multi-body BEM** for particle clusters (`merge_meshes`, `assemble_multibody_pmchwt`)
+- **H-matrix compression** with ACA for O(N log N) matvec (`HMatrix`, `solve_hmatrix_gmres`)
+- **FMM acceleration** with octree + SVD (`FMMOperator`, `solve_fmm_gmres`)
+- **Batched orientation averaging** -- 9.4x faster solve step (`orientation_average_mueller_batched`)
+- **Higher-order quadratures** -- Dunavant rules up to 25 points (degree 10)
+- **Numba JIT acceleration** -- automatic speedup for singular corrections when numba is installed
+- **Non-spherical particles** -- validated on spheroids and cube-like shapes
+- **Absorbing particles** -- complex refractive index (m = n + ik)
+- **OpenCL GPU acceleration** (`bem_opencl.py`)
+- **Mesh I/O** -- STL, OBJ, Gmsh (.msh v2/v4)
+
 ## Installation
 
 **Requirements:** Python 3.8+, NumPy, SciPy.
 
+**Optional:** [Numba](https://numba.pydata.org/) for JIT-accelerated singular corrections.
+
 ```bash
 pip install numpy scipy
+pip install numba  # optional, ~2x speedup for singular corrections
 ```
 
 No further installation needed — just place `bem_core.py` in your project and import it:
@@ -45,7 +63,7 @@ Rule of thumb: need ~10 elements per wavelength → `refinements ≈ ceil(log4(1
 
 | Parameter | Default | Description |
 |---|---|---|
-| `quad_order` | 7 | Triangle quadrature (1, 3, or 7 points). 7 recommended |
+| `quad_order` | 7 | Triangle quadrature points. Supported: 1 (1 pt), 3 (3 pts), 7 (7 pts, degree 5), 13 (13 pts, degree 7), 25 (25 pts, degree 10) |
 | `sM` | −1 | Far-field sign: −1 for PMCHWT (dielectric), +1 for PEC |
 | `tol` (GMRES) | 1e-6 | Relative residual tolerance |
 | `maxiter` (GMRES) | 200 | Maximum GMRES iterations |
@@ -175,6 +193,79 @@ Q_ext, Q_sca = compute_cross_sections(rwg, verts, tris, J, M, k, eta, radius, sM
 print(f"Q_ext = {Q_ext:.4f}, Q_sca = {Q_sca:.4f}")
 ```
 
+### 7. Adaptive Mesh Refinement
+
+```python
+from bem_core import icosphere, refine_mesh, adaptive_refine, build_rwg
+
+# Manual: refine specific triangles
+verts, tris = icosphere(1.0, refinements=1)
+mask = np.array([True]*40 + [False]*40)  # refine first half
+verts, tris = refine_mesh(verts, tris, mask, project_to_sphere=True)
+
+# Automatic: refine until edges < λ/5
+verts, tris = icosphere(1.0, refinements=1)
+verts, tris = adaptive_refine(verts, tris, k=6.0, max_edge_per_wavelength=0.2,
+                               project_to_sphere=True)
+rwg = build_rwg(verts, tris)
+```
+
+### 8. Multi-Body Scattering (Particle Clusters)
+
+```python
+from bem_core import (icosphere, build_rwg, assemble_multibody_pmchwt,
+                      compute_rhs_planewave, compute_cross_sections)
+
+# Define two spheres with different positions and materials
+v1, t1 = icosphere(0.5, refinements=2)
+v2, t2 = icosphere(0.5, refinements=2)
+v2[:, 0] += 2.0  # shift sphere 2 along x
+
+k_ext = 2.0; eta_ext = 1.0
+bodies = [
+    {'verts': v1, 'tris': t1, 'k_int': k_ext * 1.5, 'eta_int': eta_ext / 1.5},
+    {'verts': v2, 'tris': t2, 'k_int': k_ext * 1.3, 'eta_int': eta_ext / 1.3},
+]
+
+Z, rwg_list, rwg, verts, tris, body_rwg_ranges = \
+    assemble_multibody_pmchwt(bodies, k_ext, eta_ext)
+b = compute_rhs_planewave(rwg, verts, tris, k_ext, eta_ext)
+coeffs = np.linalg.solve(Z, b)
+```
+
+### 9. H-Matrix Compressed Solve
+
+```python
+from bem_core import HMatrix, solve_hmatrix_gmres
+
+# Build H-matrix from dense Z (ACA compression)
+Z_hmat = HMatrix(Z, rwg, verts, tris, eta=3.0, aca_tol=1e-4, max_rank=50)
+
+# Solve with GMRES using compressed matvec
+coeffs = solve_hmatrix_gmres(Z_hmat, b, tol=1e-6, maxiter=200)
+```
+
+### 10. FMM-Accelerated Solve
+
+```python
+from bem_core import solve_fmm_gmres
+
+# Solve using octree + SVD-compressed far-field blocks
+coeffs = solve_fmm_gmres(rwg, verts, tris, Z, b, k_ext, eta_ext,
+                           tol=1e-6, maxiter=200)
+```
+
+### 11. Batched Orientation Averaging
+
+```python
+from bem_core import orientation_average_mueller_batched
+
+# ~9.4x faster than orientation_average_mueller for the solve step
+M_avg = orientation_average_mueller_batched(
+    rwg, verts, tris, k_ext, eta_ext, theta,
+    Z_lu=Z_lu, sM=-1, n_alpha=16, n_beta=8, n_gamma=8)
+```
+
 ## Physics Conventions
 
 - Time convention: e^{+iωt}
@@ -248,7 +339,7 @@ Symmetric triangle quadrature rule.
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
-| `order` | int | 7 | Quadrature order. Supported: 1 (1 pt), 3 (3 pts), 7 (7 pts) |
+| `order` | int | 7 | Quadrature order. Supported: 1 (1 pt), 3 (3 pts), 7 (7 pts, degree 5), 13 (13 pts, degree 7), 25 (25 pts, degree 10) |
 
 **Returns:** `(pts, wts)` — quadrature points in barycentric (ξ₁,ξ₂) coordinates and weights (sum to 0.5).
 
@@ -432,6 +523,79 @@ M_avg = orientation_average_mueller(rwg, verts, tris, k_ext, eta_ext, theta,
 # M_avg[0,1,:] / M_avg[0,0,:] = degree of linear polarization
 ```
 
+#### `orientation_average_mueller_batched(...)`
+
+Same interface as `orientation_average_mueller`, but batches all RHS vectors into a single matrix and solves with one `lu_solve` call. Exploits LAPACK's multi-RHS triangular solve (BLAS-3 `dtrsm`), giving ~9.4x speedup on the solve step.
+
+### Adaptive Mesh Refinement
+
+#### `refine_mesh(verts, tris, mask=None, project_to_sphere=False, sphere_radius=None)`
+
+Refine triangles selected by `mask`. Marked triangles undergo red refinement (1-to-4 split); neighbors sharing a split edge get green closure (bisection) to maintain conformality.
+
+| Parameter | Type | Default | Description |
+|---|---|---|---|
+| `mask` | ndarray (T,) bool | None | Which triangles to refine. None = refine all (uniform) |
+| `project_to_sphere` | bool | False | Project new midpoint vertices onto sphere surface |
+| `sphere_radius` | float | None | Sphere radius for projection (auto-detected if None) |
+
+**Returns:** `(new_verts, new_tris)`.
+
+#### `adaptive_refine(verts, tris, k, max_edge_per_wavelength=0.2, project_to_sphere=False, sphere_radius=None)`
+
+Iteratively refine until all edges are shorter than `max_edge_per_wavelength * lambda`.
+
+| Parameter | Type | Default | Description |
+|---|---|---|---|
+| `k` | float/complex | — | Wavenumber (uses abs(k) for wavelength) |
+| `max_edge_per_wavelength` | float | 0.2 | Target edge length as fraction of wavelength |
+
+**Returns:** `(new_verts, new_tris)`.
+
+### Multi-Body BEM
+
+#### `merge_meshes(bodies)`
+
+Merge multiple particle meshes into a single mesh.
+
+| Parameter | Type | Description |
+|---|---|---|
+| `bodies` | list of dict | Each dict has `'verts'`, `'tris'`, `'k_int'`, `'eta_int'` |
+
+**Returns:** `(verts, tris, body_ranges)` where `body_ranges` is a list of `(tri_start, tri_end)` per body.
+
+#### `assemble_multibody_pmchwt(bodies, k_ext, eta_ext, quad_order=7)`
+
+Assemble PMCHWT system for a cluster of dielectric particles. Each particle has its own interior material; coupling between particles is through the exterior Green's function.
+
+**Returns:** `(Z, rwg_list, rwg_merged, verts, tris, body_rwg_ranges)`.
+
+### Fast Solvers
+
+#### `HMatrix(Z, rwg, verts, tris, eta=3.0, aca_tol=1e-4, max_rank=50)`
+
+Hierarchical matrix using Adaptive Cross Approximation (ACA). Splits Z into near-field (dense) and far-field (low-rank U*V^H) blocks. Enables O(N log N) matvec instead of O(N^2).
+
+| Parameter | Type | Default | Description |
+|---|---|---|---|
+| `eta` | float | 3.0 | Admissibility: block is far-field if dist > eta * max(diam_i, diam_j) |
+| `aca_tol` | float | 1e-4 | ACA approximation tolerance |
+| `max_rank` | int | 50 | Maximum rank for low-rank blocks |
+
+Methods: `matvec(x)`, `as_linear_operator()`, `memory_bytes()`.
+
+#### `solve_hmatrix_gmres(Z_hmat, b, tol=1e-6, maxiter=200, Z_diag_blocks=None)`
+
+GMRES solve using H-matrix matvec. Optional block-diagonal preconditioner via `Z_diag_blocks`.
+
+#### `FMMOperator(rwg, verts, tris, k, eta, L, K, N, tree_depth=4, ...)`
+
+FMM-accelerated matvec using octree partitioning and SVD-compressed far-field blocks. Near-field interactions use dense blocks; far-field uses low-rank approximations.
+
+#### `solve_fmm_gmres(rwg, verts, tris, Z, b, k_ext, eta_ext, tol=1e-6, maxiter=200)`
+
+GMRES solve using FMM-accelerated matvec with block-diagonal preconditioner.
+
 ## OpenCL Acceleration
 
 The optional module `bem_opencl.py` provides GPU/CPU-accelerated assembly and GMRES solver using OpenCL with float32 kernels (optimal for consumer GPUs like AMD RDNA 4 with 1/32 fp64 rate).
@@ -494,10 +658,27 @@ coeffs = solve_gmres_ocl(Z, b, tol=1e-6, maxiter=200)
 
 ## Validation
 
-Tested against Mie theory for:
-- **PEC sphere** (ka=1): Q_sca converges to analytical value (1.2% error at refinement=3 / 1280 triangles)
-- **Dielectric sphere** (m=1.5, ka=1): Q_ext and Q_sca converge (1.4% error at refinement=3)
+### Spherical particles (vs Mie theory)
+
+| Particle | ka | m | Refinement | Error |
+|---|---|---|---|---|
+| PEC sphere | 1.0 | — | 3 (1280 tris) | 1.2% Q_sca |
+| Dielectric sphere | 1.0 | 1.5 | 3 | 1.4% Q_ext |
+| Weak absorber | 2.0 | 1.5+0.01i | 3 | <2% Q_ext, Q_sca, Q_abs |
+| Moderate absorber | 2.0 | 1.5+0.1i | 3 | <2% |
+| Strong absorber | 2.0 | 1.5+0.5i | 3 | <3% |
+| Metal-like | 1.0 | 1.33+1.0i | 3 | <3% |
+
 - **Optical theorem** satisfied: Q_ext = Q_sca for PEC (lossless) scatterers
+- **Energy conservation**: Q_abs = Q_ext - Q_sca >= 0 for absorbing particles
+
+### Non-spherical particles
+
+Validated for physical consistency (energy conservation, symmetry, convergence):
+- **Prolate spheroid** (aspect ratio 2:1) -- Q_ext convergence, optical theorem
+- **Oblate spheroid** (aspect ratio 1:2) -- Q_ext convergence, optical theorem
+- **Cube-like shape** (max-norm projection) -- energy conservation
+- **Spheroid Mueller matrix** -- axial symmetry properties (S3=S4=0, M block structure)
 
 ## License
 
