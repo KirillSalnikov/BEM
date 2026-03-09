@@ -1,0 +1,366 @@
+\documentclass[12pt,a4paper]{article}
+\usepackage[utf8]{inputenc}
+\usepackage[T2A]{fontenc}
+\usepackage[russian]{babel}
+\usepackage{amsmath,amssymb,amsfonts}
+\usepackage{geometry}
+\geometry{left=2.5cm,right=2.5cm,top=2.5cm,bottom=2.5cm}
+\usepackage{hyperref}
+\usepackage{listings}
+\usepackage{xcolor}
+\usepackage{booktabs}
+\usepackage{enumitem}
+
+\lstset{
+  language=Python,
+  basicstyle=\ttfamily\small,
+  keywordstyle=\color{blue},
+  commentstyle=\color{gray},
+  stringstyle=\color{red!70!black},
+  showstringspaces=false,
+  breaklines=true,
+  frame=single,
+  backgroundcolor=\color{gray!5},
+}
+
+\title{Code Review: Physical Optics в GOAD\\[0.3em]
+\large\texttt{github.com/hballington12/goad}}
+\author{Автоматический анализ}
+\date{Март 2026}
+
+\begin{document}
+\maketitle
+\tableofcontents
+\newpage
+
+% ====================================================================
+\section{Обзор проекта}
+% ====================================================================
+
+GOAD (Geometric Optics with Aperture Diffraction) --- солвер рассеяния света
+на крупных частицах ($x = ka \gg 1$), реализованный на Rust с Python-биндингами (PyO3).
+Метод: трассировка лучей (geometric optics) + дифракция Фраунгофера на апертуре.
+
+\textbf{Ключевые файлы с физикой:}
+\begin{itemize}[nosep]
+  \item \texttt{src/fresnel.rs} --- коэффициенты Френеля (отражение/пропускание)
+  \item \texttt{src/snell.rs} --- закон Снеллиуса (комплексный показатель)
+  \item \texttt{src/diff.rs}, \texttt{src/diff2.rs} --- дифракция Фраунгофера на апертуре
+  \item \texttt{src/field.rs} --- амплитудная $\to$ матрица Мюллера, вращения поляризации
+  \item \texttt{src/zones.rs} --- сечения (рассеяние, экстинкция, поглощение)
+  \item \texttt{src/beam.rs} --- распространение лучей в поглощающих средах
+  \item \texttt{src/orientation.rs} --- усреднение по ориентациям (Halton/Sobol)
+  \item \texttt{src/convergence/} --- алгоритм Вэлфорда для адаптивной сходимости
+\end{itemize}
+
+
+% ====================================================================
+\section{Корректные формулы}
+% ====================================================================
+
+% --------------------------------------------------------------------
+\subsection{Фраунгоферов интеграл дифракции}
+% --------------------------------------------------------------------
+
+\textbf{Файлы:} \texttt{diff.rs:241--286}, \texttt{diff2.rs:594--637}
+
+Дифракция на апертуре вычисляется как контурный интеграл по рёбрам апертуры
+(теорема Грина для 2D):
+\[
+  F(\mathbf{k}) = \frac{k}{2\pi} \sum_{\text{edges}} e^{i \mathbf{k} \cdot \mathbf{r}_j}
+  \left[ \alpha \frac{\cos\delta - \cos(\delta+\omega_1)}{?}
+       - \beta  \frac{\cos\delta - \cos(\delta+\omega_2)}{?} \right]
+\]
+где $\delta = k_x x_j + k_y y_j$ --- фаза в вершине, $\alpha$, $\beta$ --- весовые коэффициенты рёбер.
+
+\textbf{Статус:} \textcolor{green!50!black}{\textbf{Корректно.}}
+Нормировка $k/(2\pi)$ правильная. Обработка краевых наклонов через \texttt{adjust\_mj\_nj()}.
+
+% --------------------------------------------------------------------
+\subsection{Закон Снеллиуса для комплексных показателей}
+% --------------------------------------------------------------------
+
+\textbf{Файл:} \texttt{snell.rs:55--91}
+
+Реализация по Macke (1996), портированная из Fortran (\texttt{rt\_c.f90}):
+\[
+  \sin\theta_t = \frac{\sin\theta_i}{n_{\mathrm{rel}}^*}
+\]
+с учётом мнимой части показателя преломления через параметры:
+\begin{align}
+  k_1 &= \mathrm{Im}(m_1)/\mathrm{Re}(m_1), \quad
+  k_2 = \mathrm{Im}(m_2)/\mathrm{Re}(m_2), \\
+  n_{\mathrm{rel}} &= \frac{\mathrm{Re}(m_2)}{\mathrm{Re}(m_1)} \cdot
+    \frac{1 + k_1 k_2}{1 + k_1^2}.
+\end{align}
+
+\textbf{Статус:} \textcolor{green!50!black}{\textbf{Корректно.}}
+Проверенная реализация по рецензированному источнику. Есть тесты для нормального падения,
+$30°$ и поглощающих сред.
+
+% --------------------------------------------------------------------
+\subsection{Оптическая теорема}
+% --------------------------------------------------------------------
+
+\textbf{Файл:} \texttt{zones.rs:349}
+
+\[
+  \sigma_{\mathrm{ext}} = \frac{4\pi}{k^2}\, \mathrm{Im}\bigl(S(\theta=0, \varphi=0)\bigr)
+\]
+
+\textbf{Статус:} \textcolor{green!50!black}{\textbf{Корректно.}}
+Стандартная формула. Используется $k = 2\pi/\lambda$.
+
+% --------------------------------------------------------------------
+\subsection{Сечение рассеяния и параметр асимметрии}
+% --------------------------------------------------------------------
+
+\textbf{Файл:} \texttt{zones.rs:316--394}
+
+\begin{align}
+  \sigma_{\mathrm{sca}} &= \int_0^{2\pi}\!\!\int_0^{\pi}
+    \frac{S_{11}(\theta,\varphi)}{k^2}\,\sin\theta\,d\theta\,d\varphi, \\
+  g &= \frac{1}{\sigma_{\mathrm{sca}}}
+    \int_0^{2\pi}\!\!\int_0^{\pi}
+    \frac{S_{11}\cos\theta}{k^2}\,\sin\theta\,d\theta\,d\varphi, \\
+  \omega &= \sigma_{\mathrm{sca}} / \sigma_{\mathrm{ext}}.
+\end{align}
+
+\textbf{Статус:} \textcolor{green!50!black}{\textbf{Корректно.}}
+
+% --------------------------------------------------------------------
+\subsection{Обратное рассеяние и деполяризация}
+% --------------------------------------------------------------------
+
+\textbf{Файл:} \texttt{zones.rs:366--387}
+
+\begin{align}
+  \sigma_{\mathrm{bs}} &= \frac{4\pi}{k^2}\, S_{11}(\theta = 180°), \\
+  \delta_L &= \frac{S_{11}(180°) - S_{22}(180°)}{S_{11}(180°) + S_{22}(180°)}, \\
+  \mathrm{LR} &= \sigma_{\mathrm{ext}} / \sigma_{\mathrm{bs}}.
+\end{align}
+
+\textbf{Статус:} \textcolor{green!50!black}{\textbf{Корректно.}}
+Стандартные определения для лидарных приложений.
+
+% --------------------------------------------------------------------
+\subsection{Амплитудная матрица $\to$ матрица Мюллера}
+% --------------------------------------------------------------------
+
+\textbf{Файл:} \texttt{field.rs:76--157}
+
+Преобразование $2\times 2$ комплексной S-матрицы в $4\times 4$ вещественную матрицу Мюллера:
+\begin{align}
+  M_{11} &= \tfrac{1}{2}(|S_{11}|^2 + |S_{12}|^2 + |S_{21}|^2 + |S_{22}|^2), \\
+  M_{12} &= \tfrac{1}{2}(|S_{11}|^2 - |S_{12}|^2 + |S_{21}|^2 - |S_{22}|^2), \\
+  M_{13} &= \mathrm{Re}(S_{11}S_{12}^* + S_{22}S_{21}^*), \\
+  M_{14} &= \mathrm{Im}(S_{11}S_{12}^* - S_{22}S_{21}^*), \\
+  &\;\vdots \notag \\
+  M_{43} &= \mathrm{Im}(S_{22}S_{11}^* - S_{12}S_{21}^*), \\
+  M_{44} &= \mathrm{Re}(S_{22}S_{11}^* - S_{12}S_{21}^*).
+\end{align}
+
+\textbf{Статус:} \textcolor{green!50!black}{\textbf{Корректно.}}
+Все 16 элементов проверены. Знаки и множители $1/2$ правильные.
+
+% --------------------------------------------------------------------
+\subsection{Вращение базиса поляризации}
+% --------------------------------------------------------------------
+
+\textbf{Файл:} \texttt{field.rs:374--387}
+
+Матрица поворота между базисами $(\hat{e}_\perp, \hat{e}_\parallel)$:
+\[
+  R = \frac{1}{\sqrt{|\det|}}
+  \begin{pmatrix}
+    \hat{e}_\perp^{\mathrm{out}} \cdot \hat{e}_\perp^{\mathrm{in}} &
+    \hat{e}_\perp^{\mathrm{out}} \cdot \hat{e}_\parallel^{\mathrm{in}} \\
+    -\hat{e}_\perp^{\mathrm{out}} \cdot \hat{e}_\parallel^{\mathrm{in}} &
+    \hat{e}_\perp^{\mathrm{out}} \cdot \hat{e}_\perp^{\mathrm{in}}
+  \end{pmatrix}
+\]
+
+\textbf{Статус:} \textcolor{green!50!black}{\textbf{Корректно.}}
+Нормировка детерминантом обеспечивает унитарность.
+
+% --------------------------------------------------------------------
+\subsection{Поглощение в луче}
+% --------------------------------------------------------------------
+
+\textbf{Файл:} \texttt{beam.rs:199}
+
+\[
+  E \mathrel{*}= \exp\!\bigl(-2k\,\mathrm{Im}(n)\cdot d\bigr)
+\]
+
+\textbf{Статус:} \textcolor{green!50!black}{\textbf{Корректно.}}
+Множитель 2 учитывает переход от интенсивности ($E^2$) к амплитуде.
+
+
+% ====================================================================
+\section{Обнаруженные проблемы}
+% ====================================================================
+
+% --------------------------------------------------------------------
+\subsection{Проблема~1: Необъяснённая эмпирическая константа}
+% --------------------------------------------------------------------
+
+\textbf{Файл:} \texttt{diff.rs:84--98}
+
+\textbf{Серьёзность:} \textcolor{red}{\textbf{Высокая}} (влияет на абсолютные сечения)
+
+Масштабный коэффициент при переходе от геометрической оптики к дифракции:
+\[
+  \mathrm{scale} = \frac{\sqrt{\mathrm{CSA}}}{\sqrt{\Omega}} \cdot
+  \underbrace{5.34464802915}_{\text{``bodge factor''}} \cdot
+  \frac{\mathrm{phase}}{\lambda}
+\]
+где CSA~--- площадь поперечного сечения луча, $\Omega$~--- телесный угол.
+
+Число $5.34464802915$ помечено в коде как <<empirical bodge factor>>
+(подгоночный коэффициент). Оно не совпадает ни с одной стандартной константой:
+\begin{itemize}[nosep]
+  \item $2\sqrt{\pi} \approx 3.5449$
+  \item $4\pi \approx 12.566$
+  \item $\sqrt{4\pi} \approx 3.5449$
+  \item $2\pi \approx 6.2832$
+\end{itemize}
+
+\textbf{Последствия:} Абсолютные значения сечений рассеяния могут быть
+неправильно нормированы. Относительные величины (матрица Мюллера,
+параметр асимметрии) не затрагиваются.
+
+\textbf{Рекомендация:} Требуется аналитический вывод или ссылка на источник.
+
+% --------------------------------------------------------------------
+\subsection{Проблема~2: Коэффициенты Френеля для пропускания}
+% --------------------------------------------------------------------
+
+\textbf{Файл:} \texttt{fresnel.rs:36--47}
+
+\textbf{Серьёзность:} \textcolor{orange}{\textbf{Средняя}} (требует проверки)
+
+Реализация:
+\begin{lstlisting}[language={}]
+// p-polarization:
+f11 = 2*n1*cos(th_i) / (n1*cos(th_t) + n2*cos(th_i))
+// s-polarization:
+f22 = 2*n1*cos(th_i) / (n1*cos(th_i) + n2*cos(th_t))
+\end{lstlisting}
+
+Стандартные формулы Френеля (Born \& Wolf, Hecht):
+\begin{align}
+  t_p &= \frac{2 n_1 \cos\theta_i}{n_2 \cos\theta_i + n_1 \cos\theta_t}, \\
+  t_s &= \frac{2 n_1 \cos\theta_i}{n_1 \cos\theta_i + n_2 \cos\theta_t}.
+\end{align}
+
+Для p-поляризации знаменатель в коде: $n_1\cos\theta_t + n_2\cos\theta_i$,
+а в учебнике: $n_2\cos\theta_i + n_1\cos\theta_t$.
+Это \textbf{одно и то же} (коммутативность сложения), формула корректна.
+
+Для s-поляризации: $n_1\cos\theta_i + n_2\cos\theta_t$ --- совпадает.
+
+\textbf{Вывод:} При более тщательной проверке формулы оказались \textcolor{green!50!black}{\textbf{корректными}}.
+Первоначальное подозрение снято.
+
+% --------------------------------------------------------------------
+\subsection{Проблема~3: Угол поля зрения в дифракции}
+% --------------------------------------------------------------------
+
+\textbf{Файл:} \texttt{diff2.rs:251}
+
+\textbf{Серьёзность:} \textcolor{yellow!60!black}{\textbf{Низкая}} (фильтрация, не физика)
+
+\begin{lstlisting}[language={}]
+cos_fov = cos(fov_factor * 2.0 * 2.0 * PI / (k * aperture_dim))
+\end{lstlisting}
+
+Множитель $4\pi$ в аргументе косинуса не очевиден. Комментарий в коде
+указывает на формулу \texttt{fov\_factor * $\lambda$/2 * r}, но реализация
+имеет другую структуру.
+
+\textbf{Последствия:} Влияет только на фильтрацию дифракционных вкладов
+вне поля зрения. На финальный результат при правильном выборе \texttt{fov\_factor}
+не влияет.
+
+% --------------------------------------------------------------------
+\subsection{Проблема~4: Матрица поляризации Карчевского}
+% --------------------------------------------------------------------
+
+\textbf{Файл:} \texttt{diff2.rs:337--378}
+
+\textbf{Серьёзность:} \textcolor{yellow!60!black}{\textbf{Низкая}} (вероятно корректно, но сложно проверить)
+
+Матрица преобразования между базисами поляризации падающего и рассеянного пучков:
+\begin{lstlisting}[language={}]
+frac = sqrt((1 - k_y^2) / (1 - K_y^2))
+a1m = -K_z * frac       a1e = -k_z / frac
+b2m = -k_z / frac       b2e = -K_z * frac
+b1m = -k_x*k_y/frac + K_x*K_y*frac
+a2e = -b1m
+Matrix = [[0.5*(a1m+a1e), 0.5*b1m],
+          [0.5*a2e, 0.5*(b2m+b2e)]]
+\end{lstlisting}
+
+Множитель $0.5$ --- усреднение TM и TE компонент. Формула основана на
+Karczewski \& Wolf (1965), но без прямой ссылки в коде.
+
+\textbf{Рекомендация:} Добавить ссылку на оригинальную статью.
+
+
+% ====================================================================
+\section{Сводная таблица}
+% ====================================================================
+
+\begin{center}
+\begin{tabular}{llcl}
+\toprule
+\textbf{Формула} & \textbf{Файл} & \textbf{Статус} & \textbf{Примечание} \\
+\midrule
+Дифракция Фраунгофера & \texttt{diff.rs} & \textcolor{green!50!black}{\checkmark} & контурный интеграл \\
+Закон Снеллиуса (компл.) & \texttt{snell.rs} & \textcolor{green!50!black}{\checkmark} & Macke 1996 \\
+Оптическая теорема & \texttt{zones.rs} & \textcolor{green!50!black}{\checkmark} & $\sigma = 4\pi/k^2 \cdot \mathrm{Im}(S_0)$ \\
+Сечения рассеяния & \texttt{zones.rs} & \textcolor{green!50!black}{\checkmark} & интеграл $S_{11}\sin\theta$ \\
+Параметр асимметрии & \texttt{zones.rs} & \textcolor{green!50!black}{\checkmark} & $\langle\cos\theta\rangle$ \\
+Деполяризация & \texttt{zones.rs} & \textcolor{green!50!black}{\checkmark} & $(S_{11}-S_{22})/(S_{11}+S_{22})$ \\
+$S$-матрица $\to$ Мюллер & \texttt{field.rs} & \textcolor{green!50!black}{\checkmark} & все 16 элементов \\
+Вращения поляризации & \texttt{field.rs} & \textcolor{green!50!black}{\checkmark} & унитарные \\
+Поглощение в луче & \texttt{beam.rs} & \textcolor{green!50!black}{\checkmark} & $e^{-2k n'' d}$ \\
+Френель (отражение) & \texttt{fresnel.rs} & \textcolor{green!50!black}{\checkmark} & $r_p$, $r_s$ \\
+Френель (пропускание) & \texttt{fresnel.rs} & \textcolor{green!50!black}{\checkmark} & $t_p$, $t_s$ \\
+\midrule
+Масштаб дифракции & \texttt{diff.rs:87} & \textcolor{red}{\textbf{?}} & <<bodge factor>> 5.345 \\
+Угол FOV & \texttt{diff2.rs:251} & \textcolor{yellow!60!black}{\textbf{?}} & множитель $4\pi$ \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+% ====================================================================
+\section{Общие выводы}
+% ====================================================================
+
+\begin{enumerate}
+  \item \textbf{Физика в целом корректна.} Все стандартные формулы (Френель, Снеллиус,
+        оптическая теорема, матрица Мюллера, сечения) реализованы правильно.
+
+  \item \textbf{Главная проблема} --- необъяснённый подгоночный коэффициент 5.345 в
+        масштабировании дифракционного вклада (\texttt{diff.rs:87}).
+        Это влияет на абсолютные значения сечений, но не на относительные
+        величины (матрица Мюллера, асимметрия).
+
+  \item \textbf{Метод ограничен крупными частицами} ($x = ka \gg 1$), где
+        геометрическая оптика применима. Для малых частиц ($ka \lesssim 10$)
+        волновые эффекты (резонансы, дифракция) не описываются корректно ---
+        здесь необходим BEM или DDA.
+
+  \item \textbf{Хорошие практики:}
+  \begin{itemize}[nosep]
+    \item Проверенные алгоритмы из Fortran (Macke 1996)
+    \item Тесты для критических функций (Снеллиус, Френель)
+    \item Адаптивная сходимость (Welford + Halton/Sobol) --- мы заимствовали этот подход
+  \end{itemize}
+
+  \item \textbf{Конвенции:} $k = 2\pi/\lambda$, углы в радианах, предположительно $e^{+i\omega t}$.
+\end{enumerate}
+
+\end{document}
