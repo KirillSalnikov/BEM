@@ -1,0 +1,602 @@
+\documentclass[12pt,a4paper]{article}
+\usepackage[utf8]{inputenc}
+\usepackage[T2A]{fontenc}
+\usepackage[russian]{babel}
+\usepackage{amsmath,amssymb,amsfonts}
+\usepackage{geometry}
+\geometry{left=2.5cm,right=2.5cm,top=2.5cm,bottom=2.5cm}
+\usepackage{graphicx}
+\usepackage{hyperref}
+\usepackage{listings}
+\usepackage{xcolor}
+\usepackage{booktabs}
+\usepackage{enumitem}
+
+\lstset{
+  language=Python,
+  basicstyle=\ttfamily\small,
+  keywordstyle=\color{blue},
+  commentstyle=\color{gray},
+  stringstyle=\color{red!70!black},
+  breaklines=true,
+  frame=single,
+  numbers=left,
+  numberstyle=\tiny\color{gray},
+  showstringspaces=false,
+}
+
+\title{\textbf{BEM Solver для электромагнитного рассеяния}\\[0.3em]
+\large Руководство: физика, формулы, реализация, ускорение}
+\author{}
+\date{}
+
+\begin{document}
+\maketitle
+\tableofcontents
+\newpage
+
+% ====================================================================
+\section{Введение}
+% ====================================================================
+
+Проект реализует \textbf{метод граничных элементов} (BEM) для решения задачи рассеяния электромагнитных волн на диэлектрических и PEC телах. Реализация --- чистый Python (NumPy/SciPy) с опциональным OpenCL-ускорением.
+
+Используется физическая конвенция $e^{+i\omega t}$ и функция Грина $G = e^{ikR}/(4\pi R)$.
+
+\subsection{Состав проекта}
+
+\begin{itemize}
+  \item \texttt{bem\_core.py} --- ядро: меш, RWG базис, сборка L/K, PMCHWT, дальнее поле, матрица Мюллера, усреднение по ориентациям
+  \item \texttt{bem\_opencl.py} --- OpenCL-ускоренная сборка и GMRES matvec (float32)
+  \item \texttt{test\_farfield\_fix.py} --- валидация PEC + диэлектрик vs Mie
+  \item \texttt{test\_mueller.py} --- тест матрицы Мюллера
+  \item \texttt{test\_orient\_avg.py} --- тест усреднения по ориентациям
+  \item \texttt{test\_load\_mesh.py} --- тест загрузки STL/OBJ/Gmsh
+  \item \texttt{plot\_comparison.py} --- графики BEM vs ADDA vs Mie (PDF)
+  \item \texttt{plot\_convergence\_ka.py} --- сходимость по ka (PDF)
+  \item \texttt{plot\_mueller\_comparison.py} --- сравнение Мюллера BEM/ADDA/Mie (PDF)
+\end{itemize}
+
+\subsection{Зависимости}
+
+\begin{itemize}
+  \item \texttt{numpy}, \texttt{scipy} --- обязательные
+  \item \texttt{pyopencl} --- опционально, для OpenCL-ускорения
+  \item \texttt{matplotlib} --- для графиков
+  \item ADDA --- внешний DDA-солвер (только для сравнения)
+\end{itemize}
+
+
+% ====================================================================
+\section{Физика задачи}
+% ====================================================================
+
+\subsection{Постановка: рассеяние плоской волны на частице}
+
+Однородная диэлектрическая частица с относительным показателем преломления $m = n_1/n_0$ в однородной среде. Падающая плоская волна:
+\begin{equation}
+  \mathbf{E}^{\mathrm{inc}}(\mathbf{r}) = \mathbf{E}_0 \, e^{i k_{\mathrm{ext}} \hat{\mathbf{k}} \cdot \mathbf{r}}, \qquad
+  \mathbf{H}^{\mathrm{inc}}(\mathbf{r}) = \frac{\hat{\mathbf{k}} \times \mathbf{E}_0}{\eta_{\mathrm{ext}}} \, e^{i k_{\mathrm{ext}} \hat{\mathbf{k}} \cdot \mathbf{r}}
+\end{equation}
+где $k_{\mathrm{ext}} = \omega\sqrt{\mu_0\varepsilon_{\mathrm{ext}}}$, $\eta_{\mathrm{ext}} = \sqrt{\mu_0/\varepsilon_{\mathrm{ext}}}$.
+
+Внутри частицы: $k_{\mathrm{int}} = m \cdot k_{\mathrm{ext}}$, $\eta_{\mathrm{int}} = \eta_{\mathrm{ext}} / m$ (при $\mu_r = 1$).
+
+\subsection{Интегральные операторы}
+
+Из уравнений Максвелла и теоремы эквивалентности следуют операторы:
+\begin{align}
+  \mathcal{L}_k[\mathbf{X}](\mathbf{r}) &= ik \int_S G_k \, \mathbf{X} \, dS'
+  + \frac{i}{k} \nabla \int_S G_k \, \nabla' \cdot \mathbf{X} \, dS' \\
+  \mathcal{K}_k[\mathbf{X}](\mathbf{r}) &= \int_S \nabla G_k \times \mathbf{X} \, dS'
+\end{align}
+где $G_k(\mathbf{r},\mathbf{r}') = e^{ik|\mathbf{r}-\mathbf{r}'|} / (4\pi|\mathbf{r}-\mathbf{r}'|)$.
+
+
+\subsection{PMCHWT-формулировка}
+
+Формулировка PMCHWT (Poggio--Miller--Chang--Harrington--Wu--Tsai) из условия непрерывности тангенциальных полей:
+
+\begin{equation}
+\boxed{
+\begin{pmatrix}
+  \eta_1 \mathcal{L}_1 + \eta_2 \mathcal{L}_2 & -(\mathcal{K}_1 + \mathcal{K}_2) \\[0.5em]
+  \mathcal{K}_1 + \mathcal{K}_2 & \dfrac{\mathcal{L}_1}{\eta_1} + \dfrac{\mathcal{L}_2}{\eta_2}
+\end{pmatrix}
+\begin{pmatrix}
+  \mathbf{J} \\ \mathbf{M}
+\end{pmatrix}
+= +
+\begin{pmatrix}
+  \mathbf{b}_E \\[0.5em]
+  \mathbf{b}_H
+\end{pmatrix}
+}
+\end{equation}
+
+Индекс 1~=~ext, 2~=~int. \textbf{Знаки K-блоков}: верхний правый $-K$, нижний левый $+K$, правая часть $+\mathbf{b}$. Эта асимметричная конвенция согласована с дальним полем через $s_M = -1$.
+
+\subsection{Случай PEC (EFIE)}
+
+Для PEC: $\mathbf{M} = 0$, система упрощается до EFIE:
+\begin{equation}
+  \eta \, \mathcal{L}_{\mathrm{ext}}[\mathbf{J}] = \mathbf{b}_E
+\end{equation}
+
+
+% ====================================================================
+\section{Дискретизация: RWG базисные функции}
+% ====================================================================
+
+\subsection{Определение}
+
+Базисные функции Рао--Уилтона--Глиссона (1982) определены на парах треугольников $T_n^+$, $T_n^-$, разделяющих ребро длины $l_n$:
+\begin{equation}
+  \mathbf{f}_n(\mathbf{r}) =
+  \begin{cases}
+    +\dfrac{l_n}{2 A_n^+} (\mathbf{r} - \mathbf{r}_n^+), & \mathbf{r} \in T_n^+ \\[0.7em]
+    -\dfrac{l_n}{2 A_n^-} (\mathbf{r} - \mathbf{r}_n^-), & \mathbf{r} \in T_n^-
+  \end{cases}
+\end{equation}
+
+\subsection{Поверхностная дивергенция}
+
+\begin{equation}
+  \nabla_s \cdot \mathbf{f}_n =
+  \begin{cases}
+    +\dfrac{l_n}{A_n^+}, & \mathbf{r} \in T_n^+ \\[0.5em]
+    -\dfrac{l_n}{A_n^-}, & \mathbf{r} \in T_n^-
+  \end{cases}
+\end{equation}
+
+\textbf{Важно}: множитель $l_n / A_n^\pm$, а НЕ $l_n / (2A_n^\pm)$. Фактор 2 в знаменателе присутствует только в самих базисных функциях, но не в их дивергенции.
+
+\subsection{Масштаб задачи}
+
+\begin{center}
+\begin{tabular}{cccc}
+\toprule
+Refinements & Triangles & Vertices & RWG functions \\
+\midrule
+1 & 80 & 42 & 120 \\
+2 & 320 & 162 & 480 \\
+3 & 1280 & 642 & 1920 \\
+4 & 5120 & 2562 & 7680 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+
+% ====================================================================
+\section{Загрузка произвольных сеток}
+% ====================================================================
+
+Функция \texttt{load\_mesh(filename)} поддерживает три формата:
+
+\begin{itemize}
+  \item \textbf{STL} (binary/ASCII) --- сливает дубликаты вершин через \texttt{np.unique} с округлением
+  \item \textbf{OBJ} --- поддерживает \texttt{v/vt/vn} формат, разбивает квады на 2 треугольника
+  \item \textbf{Gmsh .msh} --- v2 и v4, извлекает элементы типа~2 (треугольники)
+\end{itemize}
+
+Пример:
+\begin{lstlisting}
+from bem_core import load_mesh, build_rwg
+verts, tris = load_mesh("particle.stl")
+rwg = build_rwg(verts, tris)
+\end{lstlisting}
+
+
+% ====================================================================
+\section{Сборка матрицы: операторы $L$ и $K$}
+% ====================================================================
+
+\subsection{Дискретный оператор $L$}
+
+\begin{equation}
+\boxed{
+  L_{mn} = ik \int_S \int_S \mathbf{f}_m \cdot \mathbf{f}_n \, G_k \, dS\,dS'
+  \;-\; \frac{i}{k} \int_S \int_S (\nabla\!\cdot\!\mathbf{f}_m)(\nabla'\!\cdot\!\mathbf{f}_n) \, G_k \, dS\,dS'
+}
+\end{equation}
+
+\textbf{Критический знак}: перед div-div членом стоит \textbf{минус}, что следует из $E^s = -i\omega A - \nabla\Phi$. Знак плюс --- распространённая ошибка.
+
+Каждый элемент включает 4 пары полу-треугольников: $(T_m^+, T_n^+)$, $(T_m^+, T_n^-)$, $(T_m^-, T_n^+)$, $(T_m^-, T_n^-)$.
+
+\subsection{Дискретный оператор $K$}
+
+\begin{equation}
+  K_{mn} = \int_S \int_S \mathbf{f}_m \cdot \big[\nabla G_k \times \mathbf{f}_n\big] \, dS\,dS'
+\end{equation}
+
+Градиент функции Грина:
+\begin{equation}
+  \nabla G_k(R) = \frac{e^{ikR}}{4\pi R} \left(ik - \frac{1}{R}\right) \hat{\mathbf{R}}
+\end{equation}
+
+\subsection{Эксплуатация симметрии}
+
+Матрицы $L$ и $K$ симметричны: $L_{mn} = L_{nm}$, $K_{mn} = K_{nm}$. В коде это используется для ускорения: вместо 4 проходов (pp, pm, mp, mm) выполняется 3~--- проход (m,p) заменяется транспозицией (p,m):
+\begin{equation}
+  L_{\mathrm{mp}}[m,n] = L_{\mathrm{pm}}[n,m] \quad\Rightarrow\quad
+  L = L_{\mathrm{pp}} + L_{\mathrm{mm}} + L_{\mathrm{pm}} + L_{\mathrm{pm}}^T
+\end{equation}
+
+
+% ====================================================================
+\section{Обработка сингулярностей}
+% ====================================================================
+
+\subsection{Извлечение сингулярности (Graglia 1993)}
+
+При совпадении треугольников ($T_m = T_n$) функция Грина разбивается:
+\begin{equation}
+  G_k(R) = \underbrace{\frac{1}{4\pi R}}_{G_0}
+  + \underbrace{\frac{e^{ikR} - 1}{4\pi R}}_{G_{\mathrm{smooth}}}
+\end{equation}
+
+$G_{\mathrm{smooth}}(0) = ik/(4\pi)$ --- конечна, интегрируется стандартной квадратурой.
+
+\subsection{Аналитический интеграл потенциала}
+
+Для $G_0$ вычисляется аналитически потенциал плоского треугольника:
+\begin{equation}
+  P(\mathbf{r}) = \int_T \frac{dS'}{|\mathbf{r} - \mathbf{r}'|}
+\end{equation}
+и векторный потенциал $\mathbf{V}(\mathbf{r}) = \int_T \mathbf{r}'/|\mathbf{r} - \mathbf{r}'| \, dS'$ для коррекции скалярной и векторной частей оператора $L$.
+
+\subsection{Оператор $K$: PV-интеграл}
+
+Для копланарных треугольников ($T_m = T_n$) PV-интеграл $\mathcal{K}$ равен нулю по симметрии --- сингулярные пары пропускаются.
+
+
+% ====================================================================
+\section{Сборка PMCHWT системы}
+% ====================================================================
+
+Функция \texttt{assemble\_pmchwt} собирает блочную систему:
+\begin{equation}
+  Z = \begin{pmatrix}
+    \eta_1 L_1 + \eta_2 L_2 & -(K_1 + K_2) \\
+    K_1 + K_2 & L_1/\eta_1 + L_2/\eta_2
+  \end{pmatrix}
+\end{equation}
+
+Параметр \texttt{parallel=True} запускает сборку $L_1,K_1$ и $L_2,K_2$ в параллельных потоках (BLAS отпускает GIL).
+
+
+% ====================================================================
+\section{Решение системы}
+% ====================================================================
+
+\subsection{LU-разложение (прямой метод)}
+
+По умолчанию: \texttt{scipy.linalg.lu\_factor/lu\_solve}. Сложность $O(N^3)$. Преимущество: при усреднении по ориентациям факторизация делается один раз, каждая новая правая часть решается за $O(N^2)$.
+
+\subsection{GMRES (итерационный)}
+
+Функция \texttt{solve\_gmres(Z, b)} --- GMRES с блочно-диагональным предобусловливателем:
+\begin{equation}
+  M^{-1} = \begin{pmatrix} Z_{11}^{-1} & 0 \\ 0 & Z_{22}^{-1} \end{pmatrix}
+\end{equation}
+
+Каждый блок факторизуется LU один раз. Для PMCHWT сходится за 10--20 итераций. Эффективен при большом $N$ или с OpenCL-ускоренным matvec.
+
+
+% ====================================================================
+\section{Дальнее поле и сечения}
+% ====================================================================
+
+\subsection{Амплитуда рассеяния}
+
+\begin{equation}
+  \mathbf{F}(\hat{\mathbf{r}}) = -\frac{ik}{4\pi} \left[
+    \eta\,\mathbf{J}_\perp + s_M\,\hat{\mathbf{r}} \times \tilde{\mathbf{M}}
+  \right]
+\end{equation}
+где $\tilde{\mathbf{J}} = \int_S \mathbf{J} \, e^{-ik\hat{\mathbf{r}}\cdot\mathbf{r}'} dS'$, $\mathbf{J}_\perp = \tilde{\mathbf{J}} - \hat{\mathbf{r}}(\hat{\mathbf{r}}\cdot\tilde{\mathbf{J}})$.
+
+\textbf{Знак $s_M = -1$} для PMCHWT-конвенции (см.~раздел~2.3). Для PEC $\mathbf{M}=0$, знак не важен.
+
+\subsection{Сечения}
+
+\begin{align}
+  Q_{\mathrm{sca}} &= \frac{1}{\pi a^2} \int_{4\pi} \frac{|\mathbf{F}|^2}{|E_0|^2} \, d\Omega \\
+  Q_{\mathrm{ext}} &= \frac{4\pi}{k \pi a^2} \operatorname{Im}\left[\mathbf{F}(\hat{\mathbf{k}}) \cdot \hat{\mathbf{e}}_{\mathrm{pol}}\right]
+  \quad\text{(оптическая теорема)}
+\end{align}
+
+
+% ====================================================================
+\section{Матрица амплитудного рассеяния и матрица Мюллера}
+% ====================================================================
+
+\subsection{Амплитудная матрица}
+
+Связь компонент рассеянного поля с падающим в плоскости рассеяния:
+\begin{equation}
+  \begin{pmatrix} E_\parallel^s \\ E_\perp^s \end{pmatrix}
+  = \frac{e^{ikr}}{-ikr}
+  \begin{pmatrix} S_2 & S_3 \\ S_4 & S_1 \end{pmatrix}
+  \begin{pmatrix} E_\parallel^i \\ E_\perp^i \end{pmatrix}
+\end{equation}
+
+Связь с дальним полем: $S = -ik \cdot F$. Для сферы $S_3 = S_4 = 0$.
+
+Функция \texttt{compute\_amplitude\_matrix} решает для двух поляризаций (par и perp), возвращает $S_1(\theta), S_2(\theta), S_3(\theta), S_4(\theta)$.
+
+\subsection{Матрица Мюллера}
+
+$4\times4$ матрица, связывающая параметры Стокса падающего и рассеянного света (конвенция Борена--Хаффмана, eq.~3.16):
+
+\begin{align}
+  M_{11} &= \tfrac{1}{2}(|S_1|^2 + |S_2|^2 + |S_3|^2 + |S_4|^2) \\
+  M_{12} &= \tfrac{1}{2}(|S_2|^2 - |S_1|^2 + |S_4|^2 - |S_3|^2) \\
+  M_{33} &= \mathrm{Re}(S_1 S_2^* + S_3 S_4^*) \\
+  M_{34} &= \mathrm{Im}(S_2 S_1^* + S_4 S_3^*)
+\end{align}
+
+Нормализация: $M_{ij} / k^2$, так что $\int M_{11} \, d\Omega = C_{\mathrm{sca}}$.
+
+Функция \texttt{compute\_mueller\_matrix} --- обёртка: амплитудная матрица $\to$ Мюллер.
+
+
+% ====================================================================
+\section{Усреднение по ориентациям}
+% ====================================================================
+
+Функция \texttt{orientation\_average\_mueller} вычисляет среднюю матрицу Мюллера по ориентациям частицы, задаваемым углами Эйлера $(\alpha, \beta, \gamma)$ в конвенции ZYZ:
+\begin{equation}
+  \langle M_{ij}(\theta) \rangle = \frac{1}{8\pi^2} \int_0^{2\pi}\!d\alpha \int_0^{\pi}\!\sin\beta\,d\beta \int_0^{2\pi}\!d\gamma \; M_{ij}(\theta; \alpha,\beta,\gamma)
+\end{equation}
+
+\subsection{Ключевые детали реализации}
+
+\begin{enumerate}
+  \item Матрица системы $Z$ факторизуется LU один раз, для каждой ориентации решается только обратная подстановка $O(N^2)$.
+  \item Для каждой ориентации $(\alpha,\beta,\gamma)$ вращается направление падения: $\hat{\mathbf{k}} = R(\alpha,\beta,\gamma) \cdot \hat{\mathbf{z}}$.
+  \item Направления наблюдения $\hat{\mathbf{r}}$ вычисляются \textbf{в плоскости рассеяния} текущего $\hat{\mathbf{k}}$, а не в лабораторной системе:
+  \begin{equation}
+    \hat{\mathbf{r}} = \cos\theta \, \hat{\mathbf{k}} + \sin\theta \, \hat{\mathbf{e}}_\parallel^{\mathrm{lab}}
+  \end{equation}
+  \item Рассеянное поле проецируется на базис плоскости рассеяния $(\hat{\mathbf{e}}_\parallel^{\mathrm{sca}}, \hat{\mathbf{e}}_\perp^{\mathrm{lab}})$.
+\end{enumerate}
+
+Квадратура: Гаусса--Лежандра по $\beta$, равномерная по $\alpha$ и $\gamma$.
+
+Для сферы $\langle M_{ij} \rangle = M_{ij}$ (тест: отклонение $< 10^{-4}$).
+
+
+% ====================================================================
+\section{OpenCL-ускорение}
+% ====================================================================
+
+Модуль \texttt{bem\_opencl.py} содержит GPU-ядра на float32 для двух основных операций.
+
+\subsection{Ядро сборки \texttt{assemble\_LK\_block}}
+
+Каждый work-item вычисляет один элемент $(b, n)$ матриц $L$ и $K$. Внутренний цикл по $N_q \times N_q = 49$ парам квадратурных точек --- всё в регистрах, без промежуточных массивов.
+
+Результат float32 накапливается в float64 на хосте. Относительная разница с f64: $\sim 10^{-5}$--$10^{-7}$, что не влияет на точность BEM (1--3\%).
+
+\subsection{Ядро matvec \texttt{complex\_matvec}}
+
+Для GMRES: $y = Z \cdot x$ на GPU. Матрица $Z$ хранится в float32 (2x меньше памяти).
+
+\subsection{Производительность}
+
+\begin{center}
+\begin{tabular}{lccc}
+\toprule
+& NumPy (CPU) & POCL (CPU OpenCL) & GPU (оценка) \\
+\midrule
+Сборка $N=1920$ & 87\,с & 12\,с & $\sim$3--7\,с \\
+Главный цикл & 68\,с & 3\,с & $\sim$0.1\,с \\
+GMRES solve & 7\,с & 2.5\,с & $\sim$1\,с \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+Узкое место при OpenCL --- сингулярные коррекции на CPU ($\sim$3\,с на оператор).
+
+\subsection{Использование}
+
+\begin{lstlisting}
+from bem_opencl import assemble_pmchwt_ocl, solve_gmres_ocl
+
+Z, L_ext, K_ext = assemble_pmchwt_ocl(
+    rwg, verts, tris, k_ext, k_int, eta_ext, eta_int)
+x = solve_gmres_ocl(Z, b, tol=1e-5)
+\end{lstlisting}
+
+Автоматически выбирает GPU (если доступен) или CPU OpenCL.
+
+
+% ====================================================================
+\section{Валидация}
+% ====================================================================
+
+\subsection{Точность vs Mie (диэлектрическая сфера, $m = 1.5$)}
+
+\begin{center}
+\begin{tabular}{ccccc}
+\toprule
+$ka$ & ref & $N_{\mathrm{RWG}}$ & Ошибка $Q_{\mathrm{ext}}$ & Время \\
+\midrule
+1.0 & 2 & 480 & 5.9\% & 10\,с \\
+1.0 & 3 & 1920 & 1.4\% & 87\,с \\
+2.0 & 3 & 1920 & 0.66\% & 87\,с \\
+3.0 & 3 & 1920 & 1.7\% & 87\,с \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\subsection{Точность vs Mie (PEC сфера)}
+
+\begin{center}
+\begin{tabular}{cccc}
+\toprule
+$ka$ & ref & $N_{\mathrm{RWG}}$ & Ошибка $Q_{\mathrm{ext}}$ \\
+\midrule
+1.0 & 1 & 120 & 15.7\% \\
+1.0 & 2 & 480 & 4.3\% \\
+1.0 & 3 & 1920 & 1.2\% \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\subsection{Оптическая теорема}
+
+$Q_{\mathrm{ext}} = Q_{\mathrm{sca}}$ для PEC (нет поглощения) --- выполняется с точностью $< 0.1\%$.
+
+\subsection{Матрица Мюллера}
+
+Для сферы: $S_3 = S_4 \approx 10^{-14}$ (ноль), $M_{22} = M_{33}$, $M_{23} = -M_{32}$ --- точно. Блочно-диагональная структура (внедиагональные блоки $\sim 10^{-14}$).
+
+
+% ====================================================================
+\section{Как запускать}
+% ====================================================================
+
+\subsection{Базовый тест}
+
+\begin{lstlisting}
+cd ~/bem_solver
+python test_farfield_fix.py    # PEC + dielectric vs Mie
+python test_mueller.py         # Mueller matrix test
+\end{lstlisting}
+
+\subsection{Произвольная форма}
+
+\begin{lstlisting}
+from bem_core import load_mesh, build_rwg, assemble_pmchwt
+from bem_core import compute_rhs_planewave, compute_mueller_matrix
+import numpy as np
+
+verts, tris = load_mesh("particle.stl")
+# масштабировать если нужно: verts *= scale
+
+rwg = build_rwg(verts, tris)
+k_ext = 2*np.pi / wavelength
+m_rel = 1.5
+k_int = k_ext * m_rel
+eta_ext = 1.0; eta_int = eta_ext / m_rel
+
+Z, L_ext, K_ext = assemble_pmchwt(rwg, verts, tris,
+    k_ext, k_int, eta_ext, eta_int)
+b = compute_rhs_planewave(rwg, verts, tris, k_ext, eta_ext)
+
+from scipy.linalg import lu_factor, lu_solve
+Z_lu = lu_factor(Z)
+x = lu_solve(Z_lu, b)
+
+N = rwg['N']
+theta = np.linspace(0, np.pi, 181)
+result = compute_mueller_matrix(rwg, verts, tris,
+    k_ext, eta_ext, theta, Z_lu=Z_lu, sM=-1)
+\end{lstlisting}
+
+\subsection{Усреднение по ориентациям}
+
+\begin{lstlisting}
+from bem_core import orientation_average_mueller
+
+M_avg = orientation_average_mueller(rwg, verts, tris,
+    k_ext, eta_ext, theta,
+    Z=Z,  # or Z_lu=Z_lu
+    n_alpha=8, n_beta=8, n_gamma=8)
+# M_avg shape: (4, 4, len(theta))
+\end{lstlisting}
+
+\subsection{Типичный вывод}
+
+\begin{verbatim}
+=== BEM Solver: Dielectric Sphere, ka=2.0, m=1.5 ===
+  Mesh: 1280 triangles, 1920 RWG
+  Assembling 3840x3840 PMCHWT matrix...
+  Parallel assembly: ext + int...
+    [OCL/f32] Main loop: 3.0s
+    [OCL/f32] Singular corrections (CPU/f64): 2.9s
+  Total PMCHWT: 12.6s
+  GMRES converged in 13 iterations, 0.2s
+
+  Q_ext (BEM) = 1.786467
+  Q_ext (Mie) = 1.798418
+  Relative error: 0.66%
+\end{verbatim}
+
+
+% ====================================================================
+\section{Масштабирование BEM vs DDA}
+% ====================================================================
+
+\begin{center}
+\begin{tabular}{lcc}
+\toprule
+& BEM (PMCHWT + LU) & DDA (ADDA + FFT) \\
+\midrule
+Неизвестные & $N \sim (ka)^2$ (поверхность) & $N \sim (ka)^3$ (объём) \\
+Сборка & $O(N^2)$ & $O(N)$ \\
+Решение (LU / FFT) & $O(N^3)$ & $O(N \log N)$ \\
+Память & $O(N^2)$ & $O(N)$ \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\textbf{BEM выигрывает когда:}
+\begin{itemize}
+  \item Много правых частей (усреднение по ориентациям) --- LU факторизуется один раз
+  \item Тонкие/плоские частицы --- поверхностных элементов много меньше объёмных
+  \item С FMM/H-матрицами --- $O(N \log N)$ сборка и matvec
+\end{itemize}
+
+
+% ====================================================================
+\section{Исправленные ошибки}
+% ====================================================================
+
+В процессе разработки были найдены и исправлены 4 критические ошибки:
+
+\begin{enumerate}
+  \item \textbf{Знак div-div члена в $L$}: было $+i/k \cdot D$, исправлено на $-i/k \cdot D$. Следует из $E^s = -i\omega A - \nabla\Phi$.
+
+  \item \textbf{Множитель дивергенции}: было $l/(2A)$, исправлено на $l/A$. Фактор 2 присутствует только в базисных функциях, не в их дивергенции.
+
+  \item \textbf{Знаки K-блоков в PMCHWT}: было $[+K; -K]$, исправлено на $[-K; +K]$ с правой частью $+\mathbf{b}$. Асимметричная конвенция.
+
+  \item \textbf{Знак $s_M$ в дальнем поле}: было $s_M = +1$, исправлено на $s_M = -1$ для согласованности с PMCHWT.
+\end{enumerate}
+
+Каждая ошибка давала 10--50\% погрешности; совместно они давали $\sim$50\% ошибку в $Q_{\mathrm{sca}}$. После исправлений --- 0.66\% при $ka=2$, ref=3.
+
+
+% ====================================================================
+\section{Ограничения}
+% ====================================================================
+
+\begin{enumerate}
+  \item \textbf{Только замкнутые поверхности}: меш должен быть замкнутым (нет граничных рёбер).
+  \item \textbf{Плотная матрица}: $O(N^2)$ по памяти, $O(N^3)$ LU. Для $N > 5000$ нужна FMM.
+  \item \textbf{Одна частица}: нет поддержки множественных тел.
+  \item \textbf{Нет адаптивной квадратуры}: для близких (но не совпадающих) треугольников.
+  \item \textbf{Поглощение}: комплексный $m$ формально поддерживается, но не тестировался.
+  \item \textbf{Float32 OpenCL}: 7 значащих цифр; достаточно для BEM ($\sim$1\% точность), но не для прецизионных вычислений.
+\end{enumerate}
+
+
+% ====================================================================
+\section{Литература}
+% ====================================================================
+
+\begin{enumerate}
+  \item S.M.~Rao, D.R.~Wilton, A.W.~Glisson, ``Electromagnetic scattering by surfaces of arbitrary shape'', IEEE TAP, 1982.
+  \item R.D.~Graglia, ``On the numerical integration of the linear shape functions times the 3-D Green's function or its gradient on a plane triangle'', IEEE TAP, 1993.
+  \item A.J.~Poggio, E.K.~Miller, ``Integral equation solutions of three-dimensional scattering problems'', in Computer Techniques for Electromagnetics, Pergamon, 1973.
+  \item C.F.~Bohren, D.R.~Huffman, ``Absorption and Scattering of Light by Small Particles'', Wiley, 1983.
+  \item M.A.~Yurkin, A.G.~Hoekstra, ``The discrete-dipole-approximation code ADDA: capabilities and known limitations'', JQSRT, 2011.
+  \item W.C.~Chew, J.-M.~Jin, E.~Michielssen, J.~Song, ``Fast and Efficient Algorithms in Computational Electromagnetics'', Artech House, 2001.
+\end{enumerate}
+
+
+\end{document}
