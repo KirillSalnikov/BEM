@@ -871,6 +871,77 @@ $ka$ & BEM & ADDA \\
 При $ka \geq 2$ (достаточное разрешение сетки) BEM и ADDA согласуются с точностью 1--5\% по всем элементам матрицы Мюллера. Расхождение при малых $ka$ обусловлено грубостью сетки (ref=2, 480 RWG).
 
 
+\subsection{Адаптивное усреднение с квази-случайными последовательностями}
+
+Фиксированная сетка углов Эйлера ($n_\alpha \times n_\beta \times n_\gamma$) может быть
+избыточной или недостаточной. Адаптивный алгоритм автоматически определяет необходимое
+число ориентаций по заданной точности.
+
+\textbf{Квази-случайные последовательности.}
+Вместо псевдо-случайных чисел используются последовательности с низкой дискрепансой~(low-discrepancy),
+которые заполняют пространство SO(3) более равномерно:
+\begin{itemize}
+  \item \textbf{Halton} --- последовательность по базам (2, 3, 5) для $(\alpha, \cos\beta, \gamma)$.
+        Простая, детерминированная, не требует внешних библиотек.
+  \item \textbf{Sobol} --- скремблированная последовательность Соболя через \texttt{scipy.stats.qmc.Sobol}.
+        Лучшая равномерность в высоких размерностях.
+  \item \textbf{Random} --- обычные псевдо-случайные числа (для сравнения).
+\end{itemize}
+Углы Эйлера генерируются как: $\alpha = 2\pi u_1$, $\beta = \arccos(1 - 2u_2)$, $\gamma = 2\pi u_3$,
+что обеспечивает равномерное распределение на SO(3).
+
+\textbf{Алгоритм Вэлфорда (Welford's online algorithm).}
+Бегущие среднее и стандартная ошибка среднего (SEM) вычисляются инкрементально
+без хранения всех результатов:
+\begin{align}
+  \delta_n &= x_n - \bar{x}_{n-1}, \\
+  \bar{x}_n &= \bar{x}_{n-1} + \delta_n / n, \\
+  M_{2,n} &= M_{2,n-1} + \delta_n \cdot (x_n - \bar{x}_n), \\
+  \mathrm{SEM}_n &= \sqrt{M_{2,n} / n} / (n-1).
+\end{align}
+Критерий остановки: $\mathrm{SEM}(Q_\mathrm{sca}) / Q_\mathrm{sca} < \mathrm{rtol}$.
+
+\textbf{API:}
+\begin{verbatim}
+result = orientation_average_mueller_adaptive(
+    rwg, verts, tris, k_ext, eta_ext, theta_arr,
+    Z_lu=Z_lu, sM=-1,
+    sampling='halton',    # 'halton', 'sobol', 'random'
+    max_orient=2000,      # максимум ориентаций
+    min_orient=30,        # минимум до проверки сходимости
+    batch_size=20,        # батч lu_solve
+    rtol=0.01,            # целевая относительная SEM
+    monitor_param='Q_sca' # контролируемый параметр
+)
+M = result['M']           # 4×4×N_theta
+n = result['n_orient']    # фактическое число ориентаций
+ok = result['converged']  # достигнута ли сходимость
+\end{verbatim}
+
+\textbf{Результаты} (облатный эллипсоид $a_z/a_x = 0.5$, $ka = 2$, $m = 1.5$, ref=3):
+
+\begin{center}
+\begin{tabular}{lcccc}
+\toprule
+Метод & $N_\mathrm{or}$ & $Q_\mathrm{sca}$ & Разн. с сеткой & Время \\
+\midrule
+Сетка $8 \times 5 \times 8$ & 320 & 1.6136 & (эталон) & 132\,с \\
+Halton, rtol=5\% & 60 & 1.6470 & 2.1\% & 25\,с \\
+Halton, rtol=2\% & 260 & 1.6170 & 0.2\% & 108\,с \\
+Halton, rtol=1\% & 1040 & 1.6154 & 0.1\% & 433\,с \\
+Halton, rtol=0.5\% & 2000* & 1.6144 & 0.05\% & 831\,с \\
+Sobol, rtol=1\% & 1040 & 1.6134 & 0.01\% & 432\,с \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\noindent *~Не сошлось за 2000 ориентаций (SEM = 0.72\%), но фактическая ошибка 0.05\%.
+
+Идея заимствована из проекта GOAD~(Geometric Optics with Aperture Diffraction,
+\texttt{github.com/hballington12/goad}), где аналогичный подход
+(Welford + Halton/Sobol) применяется для ray-tracing.
+
+
 % ====================================================================
 \section{OpenCL-ускорение}
 % ====================================================================
@@ -1118,6 +1189,7 @@ $M_{34}/M_{11}$ & 0.00\% (нуль для сферы) \\
   \item[$\checkmark$] Адаптивная сетка --- \texttt{adaptive\_refine}
   \item[$\checkmark$] Высокие квадратуры --- Dunavant 13, 25 точек
   \item[$\checkmark$] Ускоренные солверы --- FMM, H-матрицы, GMRES
+  \item[$\checkmark$] Адаптивное усреднение по ориентациям --- Halton/Sobol + Welford
 \end{itemize}
 
 

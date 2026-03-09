@@ -1662,6 +1662,257 @@ def orientation_average_mueller_batched(rwg, verts, tris, k_ext, eta_ext, theta_
 
 
 # ============================================================
+# Quasi-random sequences for orientation sampling
+# ============================================================
+
+def _halton_sequence(index, base):
+    """Halton quasi-random sequence value for given index and base. Returns value in [0, 1)."""
+    result = 0.0
+    f = 1.0 / base
+    i = index
+    while i > 0:
+        result += f * (i % base)
+        i //= base
+        f /= base
+    return result
+
+
+def _halton_orientations(n):
+    """Generate n Halton quasi-random Euler angles (α, β, γ) in radians.
+    Uses primes 2, 3, 5 for three dimensions.
+    β is sampled uniformly on the sphere: β = arccos(1 - 2*u2).
+    """
+    orientations = []
+    for i in range(1, n + 1):  # skip i=0 (gives 0,0,0)
+        u1 = _halton_sequence(i, 2)
+        u2 = _halton_sequence(i, 3)
+        u3 = _halton_sequence(i, 5)
+        alpha = u1 * 2 * np.pi
+        beta = np.arccos(1.0 - 2.0 * u2)
+        gamma = u3 * 2 * np.pi
+        orientations.append((alpha, beta, gamma))
+    return orientations
+
+
+def _sobol_orientations(n):
+    """Generate n Sobol quasi-random Euler angles (α, β, γ) in radians.
+    Uses scipy.stats.qmc.Sobol for 3D quasi-random sequence.
+    β is sampled uniformly on the sphere: β = arccos(1 - 2*u2).
+    """
+    try:
+        from scipy.stats.qmc import Sobol
+        sampler = Sobol(d=3, scramble=True)
+        # Sobol needs power-of-2 samples; generate next power of 2 >= n
+        m = int(np.ceil(np.log2(max(n, 2))))
+        points = sampler.random_base2(m)[:n]  # shape (n, 3), values in [0,1)
+    except ImportError:
+        # Fallback: use Halton if scipy.stats.qmc not available
+        print("    Warning: scipy.stats.qmc.Sobol not available, using Halton")
+        return _halton_orientations(n)
+
+    orientations = []
+    for i in range(n):
+        u1, u2, u3 = points[i]
+        alpha = u1 * 2 * np.pi
+        beta = np.arccos(1.0 - 2.0 * u2)
+        gamma = u3 * 2 * np.pi
+        orientations.append((alpha, beta, gamma))
+    return orientations
+
+
+# ============================================================
+# Adaptive orientation averaging with Welford + quasi-random
+# ============================================================
+
+def orientation_average_mueller_adaptive(rwg, verts, tris, k_ext, eta_ext, theta_arr,
+                                          Z_lu=None, Z=None, sM=-1, quad_order=7,
+                                          sampling='halton', max_orient=2000,
+                                          min_orient=50, batch_size=20,
+                                          rtol=0.01, monitor_param='Q_sca'):
+    """Orientation-averaged Mueller matrix with adaptive convergence.
+
+    Uses quasi-random sequences (Halton or Sobol) for faster convergence
+    (~O(1/N) vs O(1/√N) for random), combined with Welford's online algorithm
+    for running mean and standard error of the mean (SEM).
+
+    Stops when relative SEM of the monitored parameter drops below rtol,
+    or max_orient is reached.
+
+    Parameters:
+      sampling      : 'halton', 'sobol', or 'random'
+      max_orient    : maximum number of orientations
+      min_orient    : minimum before checking convergence
+      batch_size    : orientations per batch (for batched lu_solve)
+      rtol          : target relative error (SEM/mean) for convergence
+      monitor_param : 'Q_sca' (integrated M11) or 'M11_90' (M11 at 90°)
+
+    Returns: dict with keys:
+      'M'           : (4, 4, N_theta) averaged Mueller matrix
+      'n_orient'    : number of orientations used
+      'converged'   : True if rtol was achieved
+      'sem_history' : list of (n, relative_sem) tuples
+    """
+    from scipy.linalg import lu_factor, lu_solve
+
+    N = rwg['N']
+    ntheta = len(theta_arr)
+
+    if Z_lu is None:
+        if Z is None:
+            raise ValueError("Provide either Z or Z_lu")
+        Z_lu = lu_factor(Z)
+
+    # Precompute quadrature points for far field
+    quad_pts, quad_wts = tri_quadrature(quad_order)
+    lam0 = 1 - quad_pts[:,0] - quad_pts[:,1]
+    def get_qpts(ti):
+        t = tris[ti]; v0 = verts[t[:,0]]; v1 = verts[t[:,1]]; v2 = verts[t[:,2]]
+        return np.einsum('q,ni->nqi', lam0, v0) + np.einsum('q,ni->nqi', quad_pts[:,0], v1) + \
+               np.einsum('q,ni->nqi', quad_pts[:,1], v2)
+    ff_cache = {'qp': get_qpts(rwg['tri_p']), 'qm': get_qpts(rwg['tri_m'])}
+
+    # Lab-frame vectors
+    r_hat_lab = np.zeros((ntheta, 3))
+    e_theta_lab = np.zeros((ntheta, 3))
+    e_phi_lab = np.array([0., 1., 0.])
+    for it, th in enumerate(theta_arr):
+        ct, st = np.cos(th), np.sin(th)
+        r_hat_lab[it] = [st, 0., ct]
+        e_theta_lab[it] = [ct, 0., -st]
+
+    # Generate all orientations upfront (quasi-random)
+    if sampling == 'halton':
+        all_orient = _halton_orientations(max_orient)
+    elif sampling == 'sobol':
+        all_orient = _sobol_orientations(max_orient)
+    else:
+        # Random uniform on SO(3)
+        rng = np.random.default_rng(42)
+        all_orient = []
+        for _ in range(max_orient):
+            alpha = rng.uniform(0, 2*np.pi)
+            beta = np.arccos(1.0 - 2.0 * rng.uniform())
+            gamma = rng.uniform(0, 2*np.pi)
+            all_orient.append((alpha, beta, gamma))
+
+    # Welford online statistics
+    n_done = 0
+    M_mean = np.zeros((4, 4, ntheta))     # running mean
+    M_m2 = np.zeros((4, 4, ntheta))       # sum of squared deviations
+    converged = False
+    sem_history = []
+
+    # Monitor index (for M11_90)
+    idx90 = np.argmin(np.abs(np.degrees(theta_arr) - 90))
+
+    print(f"    Adaptive: sampling={sampling}, max={max_orient}, rtol={rtol}, batch={batch_size}")
+
+    while n_done < max_orient:
+        # Determine batch
+        batch_end = min(n_done + batch_size, max_orient)
+        batch_orients = all_orient[n_done:batch_end]
+        actual_batch = len(batch_orients)
+
+        # Build batch RHS
+        B = np.zeros((2*N, actual_batch*2), dtype=complex)
+        orient_data = []  # store RT for each orientation
+
+        for bi, (alpha, beta, gamma) in enumerate(batch_orients):
+            R = _euler_rotation(alpha, beta, gamma)
+            RT = R.T
+            k_hat = RT @ np.array([0., 0., 1.])
+            e_par_inc = RT @ np.array([1., 0., 0.])
+            e_perp_inc = RT @ np.array([0., 1., 0.])
+            orient_data.append(RT)
+
+            B[:, bi*2]   = compute_rhs_planewave(rwg, verts, tris, k_ext, eta_ext,
+                                                   E0=e_par_inc, k_hat=k_hat,
+                                                   quad_order=quad_order)
+            B[:, bi*2+1] = compute_rhs_planewave(rwg, verts, tris, k_ext, eta_ext,
+                                                   E0=e_perp_inc, k_hat=k_hat,
+                                                   quad_order=quad_order)
+
+        # Batched solve
+        X = lu_solve(Z_lu, B)
+
+        # Compute Mueller for each orientation and update Welford
+        for bi in range(actual_batch):
+            RT = orient_data[bi]
+            J_par  = X[:N, bi*2]
+            M_par  = X[N:, bi*2]
+            J_perp = X[:N, bi*2+1]
+            M_perp = X[N:, bi*2+1]
+
+            S1 = np.zeros(ntheta, dtype=complex)
+            S2 = np.zeros(ntheta, dtype=complex)
+            S3 = np.zeros(ntheta, dtype=complex)
+            S4 = np.zeros(ntheta, dtype=complex)
+
+            for it in range(ntheta):
+                r_hat = RT @ r_hat_lab[it]
+                e_sca_par = RT @ e_theta_lab[it]
+                e_sca_perp = RT @ e_phi_lab
+
+                for pol_name, J, M_c in [('par', J_par, M_par), ('perp', J_perp, M_perp)]:
+                    Fv = _compute_far_field_vec(rwg, verts, tris, J, M_c,
+                                                 k_ext, eta_ext, r_hat,
+                                                 sM=sM, quad_order=quad_order,
+                                                 _cache=ff_cache)
+                    F_par = np.dot(Fv, e_sca_par)
+                    F_perp = np.dot(Fv, e_sca_perp)
+                    ik = -1j * k_ext
+                    if pol_name == 'par':
+                        S2[it] = ik * F_par
+                        S4[it] = ik * F_perp
+                    else:
+                        S3[it] = ik * F_par
+                        S1[it] = ik * F_perp
+
+            M_orient = amplitude_to_mueller(S1, S2, S3, S4) / k_ext**2
+
+            # Welford update
+            n_done += 1
+            delta = M_orient - M_mean
+            M_mean += delta / n_done
+            delta2 = M_orient - M_mean
+            M_m2 += delta * delta2
+
+        # Check convergence
+        if n_done >= min_orient:
+            variance = M_m2 / (n_done - 1)
+            sem = np.sqrt(np.maximum(variance, 0) / n_done)
+
+            if monitor_param == 'Q_sca':
+                # Integrated Q_sca from M11
+                C_sca_mean = 2 * np.pi * np.trapezoid(M_mean[0, 0] * np.sin(theta_arr), theta_arr)
+                C_sca_sem = 2 * np.pi * np.trapezoid(sem[0, 0] * np.sin(theta_arr), theta_arr)
+                rel_sem = C_sca_sem / max(abs(C_sca_mean), 1e-30)
+            else:  # M11_90
+                rel_sem = sem[0, 0, idx90] / max(abs(M_mean[0, 0, idx90]), 1e-30)
+
+            sem_history.append((n_done, rel_sem))
+
+            if n_done % batch_size == 0 or n_done == batch_end:
+                print(f"    n={n_done:5d}  rel_SEM={rel_sem:.2e}  "
+                      f"(target={rtol:.2e})", flush=True)
+
+            if rel_sem < rtol:
+                converged = True
+                print(f"    Converged at n={n_done} (rel_SEM={rel_sem:.2e} < {rtol})")
+                break
+
+    if not converged:
+        print(f"    Not converged after {n_done} orientations (rel_SEM={sem_history[-1][1]:.2e})")
+
+    return {
+        'M': M_mean,
+        'n_orient': n_done,
+        'converged': converged,
+        'sem_history': sem_history,
+    }
+
+
+# ============================================================
 # 10. SNC-tested assembly (n̂×RWG test functions)
 # ============================================================
 
