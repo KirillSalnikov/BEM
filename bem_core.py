@@ -10,6 +10,12 @@ from scipy.sparse.linalg import gmres as sp_gmres
 from concurrent.futures import ThreadPoolExecutor
 import time as _time
 
+try:
+    from numba import njit, prange
+    HAS_NUMBA = True
+except ImportError:
+    HAS_NUMBA = False
+
 
 # ============================================================
 # 1. Mesh generation (icosphere)
@@ -52,6 +58,155 @@ def icosphere(radius=1.0, refinements=2):
         verts = np.array(verts_list)
         tris = np.array(new_tris, dtype=np.int32)
     verts *= radius
+    return verts, tris
+
+
+def refine_mesh(verts, tris, mask=None, project_to_sphere=False, sphere_radius=None):
+    """Refine triangular mesh by splitting marked triangles.
+
+    Parameters
+    ----------
+    verts : ndarray (V, 3)
+        Vertex coordinates.
+    tris : ndarray (T, 3)
+        Triangle indices.
+    mask : ndarray (T,) of bool, optional
+        Which triangles to refine. If None, refine all (uniform).
+    project_to_sphere : bool
+        If True, project new midpoint vertices onto a sphere.
+    sphere_radius : float, optional
+        Sphere radius for projection (auto-detected if None).
+
+    Returns
+    -------
+    new_verts, new_tris : ndarray
+        Refined mesh. Marked triangles are split into 4; neighbors that share
+        a split edge get a bisection (green closure) to maintain conformality.
+    """
+    T = len(tris)
+    if mask is None:
+        mask = np.ones(T, dtype=bool)
+
+    # Build edge → triangles map
+    edge_to_tris = {}
+    for ti in range(T):
+        for j in range(3):
+            e = (min(tris[ti, j], tris[ti, (j+1)%3]),
+                 max(tris[ti, j], tris[ti, (j+1)%3]))
+            if e not in edge_to_tris:
+                edge_to_tris[e] = []
+            edge_to_tris[e].append(ti)
+
+    # Determine which edges to split
+    edge_split = {}  # edge → new vertex index
+    verts_list = list(verts)
+
+    if sphere_radius is None and project_to_sphere:
+        sphere_radius = np.mean(np.linalg.norm(verts, axis=1))
+
+    for ti in range(T):
+        if not mask[ti]:
+            continue
+        for j in range(3):
+            e = (min(tris[ti, j], tris[ti, (j+1)%3]),
+                 max(tris[ti, j], tris[ti, (j+1)%3]))
+            if e in edge_split:
+                continue
+            mid = (verts[e[0]] + verts[e[1]]) / 2
+            if project_to_sphere:
+                r = np.linalg.norm(mid)
+                if r > 1e-15:
+                    mid = mid * (sphere_radius / r)
+            edge_split[e] = len(verts_list)
+            verts_list.append(mid)
+
+    # Build new triangles
+    new_tris = []
+    for ti in range(T):
+        a, b, c = tris[ti]
+        eab = (min(a, b), max(a, b))
+        ebc = (min(b, c), max(b, c))
+        eca = (min(c, a), max(c, a))
+        split_ab = eab in edge_split
+        split_bc = ebc in edge_split
+        split_ca = eca in edge_split
+
+        n_split = split_ab + split_bc + split_ca
+
+        if n_split == 3:
+            # Red refinement: split into 4
+            ab = edge_split[eab]; bc = edge_split[ebc]; ca = edge_split[eca]
+            new_tris.extend([[a, ab, ca], [b, bc, ab], [c, ca, bc], [ab, bc, ca]])
+        elif n_split == 2:
+            # Green closure: split into 3
+            if not split_ab:
+                # bc and ca split
+                bc = edge_split[ebc]; ca = edge_split[eca]
+                new_tris.extend([[a, b, ca], [b, bc, ca], [bc, c, ca]])
+            elif not split_bc:
+                ab = edge_split[eab]; ca = edge_split[eca]
+                new_tris.extend([[b, c, ab], [c, ca, ab], [ca, a, ab]])
+            else:
+                ab = edge_split[eab]; bc = edge_split[ebc]
+                new_tris.extend([[c, a, bc], [a, ab, bc], [ab, b, bc]])
+        elif n_split == 1:
+            # Bisection: split into 2
+            if split_ab:
+                ab = edge_split[eab]
+                new_tris.extend([[a, ab, c], [ab, b, c]])
+            elif split_bc:
+                bc = edge_split[ebc]
+                new_tris.extend([[b, bc, a], [bc, c, a]])
+            else:
+                ca = edge_split[eca]
+                new_tris.extend([[c, ca, b], [ca, a, b]])
+        else:
+            new_tris.append([a, b, c])
+
+    return np.array(verts_list), np.array(new_tris, dtype=np.int32)
+
+
+def adaptive_refine(verts, tris, k, max_edge_per_wavelength=0.2,
+                    project_to_sphere=False, sphere_radius=None):
+    """Refine mesh until all edges are shorter than max_edge_per_wavelength * λ.
+
+    Parameters
+    ----------
+    k : float or complex
+        Wavenumber. Uses |k| for wavelength calculation.
+    max_edge_per_wavelength : float
+        Maximum edge length as fraction of wavelength (default 0.2 = λ/5).
+    project_to_sphere : bool
+        Project new vertices onto sphere surface.
+    sphere_radius : float, optional
+        Sphere radius for projection.
+
+    Returns
+    -------
+    new_verts, new_tris : ndarray
+    """
+    wavelength = 2 * np.pi / abs(k)
+    max_edge = max_edge_per_wavelength * wavelength
+
+    for iteration in range(20):
+        # Compute edge lengths per triangle
+        v0 = verts[tris[:, 0]]; v1 = verts[tris[:, 1]]; v2 = verts[tris[:, 2]]
+        e01 = np.linalg.norm(v1 - v0, axis=1)
+        e12 = np.linalg.norm(v2 - v1, axis=1)
+        e20 = np.linalg.norm(v0 - v2, axis=1)
+        max_edges = np.maximum(e01, np.maximum(e12, e20))
+
+        mask = max_edges > max_edge
+        n_refine = np.sum(mask)
+        if n_refine == 0:
+            break
+        print(f"    Adaptive refine iter {iteration}: {n_refine}/{len(tris)} tris "
+              f"(max edge {np.max(max_edges):.4f}, target {max_edge:.4f})")
+        verts, tris = refine_mesh(verts, tris, mask,
+                                   project_to_sphere=project_to_sphere,
+                                   sphere_radius=sphere_radius)
+
+    print(f"    Final mesh: {len(tris)} tris, {len(verts)} verts")
     return verts, tris
 
 
@@ -282,8 +437,76 @@ def tri_quadrature(order=7):
                          [b1, b2], [b2, b1], [b2, b2]])
         w1 = 0.225; w2 = 0.13239415278851; w3 = 0.12593918054483
         wts = np.array([w1, w2, w2, w2, w3, w3, w3])
+    elif order == 13:
+        # Dunavant 13-point rule (degree 7)
+        pts_list = [
+            (1/3, 1/3),
+            (0.260345966079038, 0.260345966079038),
+            (0.260345966079038, 0.479308067841923),
+            (0.479308067841923, 0.260345966079038),
+            (0.065130102902216, 0.065130102902216),
+            (0.065130102902216, 0.869739794195568),
+            (0.869739794195568, 0.065130102902216),
+            (0.048690315425316, 0.312865496004875),
+            (0.312865496004875, 0.048690315425316),
+            (0.638444188569809, 0.312865496004875),
+            (0.312865496004875, 0.638444188569809),
+            (0.048690315425316, 0.638444188569809),
+            (0.638444188569809, 0.048690315425316),
+        ]
+        wts_list = [
+            -0.149570044467670,
+            0.175615257433204, 0.175615257433204, 0.175615257433204,
+            0.053347235608839, 0.053347235608839, 0.053347235608839,
+            0.077113760890257, 0.077113760890257, 0.077113760890257,
+            0.077113760890257, 0.077113760890257, 0.077113760890257,
+        ]
+        pts = np.array(pts_list)
+        wts = np.array(wts_list)
+    elif order == 25:
+        # Dunavant 25-point rule (degree 10)
+        pts_list = [
+            (1/3, 1/3),
+            (0.028844733232685, 0.485577633383657),
+            (0.485577633383657, 0.028844733232685),
+            (0.485577633383657, 0.485577633383657),
+            (0.781036849029926, 0.109481575485037),
+            (0.109481575485037, 0.781036849029926),
+            (0.109481575485037, 0.109481575485037),
+            (0.141707219414880, 0.307939838764121),
+            (0.307939838764121, 0.141707219414880),
+            (0.550352941820999, 0.307939838764121),
+            (0.307939838764121, 0.550352941820999),
+            (0.141707219414880, 0.550352941820999),
+            (0.550352941820999, 0.141707219414880),
+            (0.025003534762686, 0.246672560639903),
+            (0.246672560639903, 0.025003534762686),
+            (0.728323904597411, 0.246672560639903),
+            (0.246672560639903, 0.728323904597411),
+            (0.025003534762686, 0.728323904597411),
+            (0.728323904597411, 0.025003534762686),
+            (0.009540815400299, 0.066803251012200),
+            (0.066803251012200, 0.009540815400299),
+            (0.923655933587500, 0.066803251012200),
+            (0.066803251012200, 0.923655933587500),
+            (0.009540815400299, 0.923655933587500),
+            (0.923655933587500, 0.009540815400299),
+        ]
+        wts_list = [
+            0.090817990382754,
+            0.036725957756467, 0.036725957756467, 0.036725957756467,
+            0.045321059435528, 0.045321059435528, 0.045321059435528,
+            0.072757916845420, 0.072757916845420, 0.072757916845420,
+            0.072757916845420, 0.072757916845420, 0.072757916845420,
+            0.028327242531057, 0.028327242531057, 0.028327242531057,
+            0.028327242531057, 0.028327242531057, 0.028327242531057,
+            0.009421667726068, 0.009421667726068, 0.009421667726068,
+            0.009421667726068, 0.009421667726068, 0.009421667726068,
+        ]
+        pts = np.array(pts_list)
+        wts = np.array(wts_list)
     else:
-        raise ValueError(f"Unsupported order {order}")
+        raise ValueError(f"Unsupported order {order}; use 4, 7, 13, or 25")
     return pts, wts
 
 
@@ -408,6 +631,153 @@ def vector_potential_integral_triangle(r_obs, v0, v1, v2):
         grad_W[d] = (_integral_R_triangle(rp, v0, v1, v2) -
                      _integral_R_triangle(rm, v0, v1, v2)) / (2 * eps)
     return r_obs * P - grad_W
+
+
+# ============================================================
+# 4b. Numba-accelerated singular corrections
+# ============================================================
+
+if HAS_NUMBA:
+    @njit(cache=True)
+    def _potential_integral_nb(r_obs, v0, v1, v2):
+        """∫_T 1/|r_obs - r'| dS' (Graglia 1993), Numba version."""
+        verts0 = v0; verts1 = v1; verts2 = v2
+        e10 = v1 - v0; e20 = v2 - v0
+        n_tri = np.array([e10[1]*e20[2] - e10[2]*e20[1],
+                          e10[2]*e20[0] - e10[0]*e20[2],
+                          e10[0]*e20[1] - e10[1]*e20[0]])
+        n_norm = np.sqrt(n_tri[0]**2 + n_tri[1]**2 + n_tri[2]**2)
+        if n_norm < 1e-15:
+            return 0.0
+        n_hat = n_tri / n_norm
+        result = 0.0
+        for i in range(3):
+            if i == 0: vi = v0; vj = v1
+            elif i == 1: vi = v1; vj = v2
+            else: vi = v2; vj = v0
+            edge = vj - vi
+            l_edge = np.sqrt(edge[0]**2 + edge[1]**2 + edge[2]**2)
+            if l_edge < 1e-15:
+                continue
+            t_hat = edge / l_edge
+            m_hat = np.array([n_hat[1]*t_hat[2] - n_hat[2]*t_hat[1],
+                              n_hat[2]*t_hat[0] - n_hat[0]*t_hat[2],
+                              n_hat[0]*t_hat[1] - n_hat[1]*t_hat[0]])
+            diff_i = r_obs - vi
+            d = diff_i[0]*m_hat[0] + diff_i[1]*m_hat[1] + diff_i[2]*m_hat[2]
+            h = diff_i[0]*n_hat[0] + diff_i[1]*n_hat[1] + diff_i[2]*n_hat[2]
+            diff_j = vj - r_obs
+            diff_ii = vi - r_obs
+            s_plus = diff_j[0]*t_hat[0] + diff_j[1]*t_hat[1] + diff_j[2]*t_hat[2]
+            s_minus = diff_ii[0]*t_hat[0] + diff_ii[1]*t_hat[1] + diff_ii[2]*t_hat[2]
+            R_plus = np.sqrt(diff_j[0]**2 + diff_j[1]**2 + diff_j[2]**2)
+            R_minus = np.sqrt(diff_ii[0]**2 + diff_ii[1]**2 + diff_ii[2]**2)
+            if R_plus + s_plus > 1e-15 and R_minus + s_minus > 1e-15:
+                log_arg = (R_plus + s_plus) / (R_minus + s_minus)
+                if log_arg > 0:
+                    result += d * np.log(log_arg)
+            if abs(h) > 1e-15:
+                R0_sq = d**2 + h**2
+                t1 = np.arctan2(d * s_plus, R0_sq + abs(h) * R_plus)
+                t2 = np.arctan2(d * s_minus, R0_sq + abs(h) * R_minus)
+                result -= abs(h) * (t1 - t2)
+        return result
+
+    @njit(cache=True)
+    def _integral_R_nb(r_obs, v0, v1, v2, quad_pts, quad_wts):
+        """∫_T |r_obs - r'| dS' (numerical quadrature), Numba version."""
+        Nq = len(quad_wts)
+        e10 = v1 - v0; e20 = v2 - v0
+        cr = np.array([e10[1]*e20[2] - e10[2]*e20[1],
+                       e10[2]*e20[0] - e10[0]*e20[2],
+                       e10[0]*e20[1] - e10[1]*e20[0]])
+        area = 0.5 * np.sqrt(cr[0]**2 + cr[1]**2 + cr[2]**2)
+        result = 0.0
+        for q in range(Nq):
+            lam0 = 1.0 - quad_pts[q, 0] - quad_pts[q, 1]
+            rr = lam0 * v0 + quad_pts[q, 0] * v1 + quad_pts[q, 1] * v2
+            dr = rr - r_obs
+            R = np.sqrt(dr[0]**2 + dr[1]**2 + dr[2]**2)
+            result += quad_wts[q] * R
+        return area * result
+
+    @njit(cache=True)
+    def _vector_potential_nb(r_obs, v0, v1, v2, quad_pts, quad_wts):
+        """∫_T r'/|r_obs - r'| dS', Numba version."""
+        P = _potential_integral_nb(r_obs, v0, v1, v2)
+        eps = 1e-6
+        grad_W = np.zeros(3)
+        for d in range(3):
+            rp = r_obs.copy(); rp[d] += eps
+            rm = r_obs.copy(); rm[d] -= eps
+            grad_W[d] = (_integral_R_nb(rp, v0, v1, v2, quad_pts, quad_wts) -
+                         _integral_R_nb(rm, v0, v1, v2, quad_pts, quad_wts)) / (2 * eps)
+        return r_obs * P - grad_W
+
+    @njit(cache=True, parallel=True)
+    def _singular_corrections_nb(L_re, L_im, N, tri_p, tri_m, div_p, div_m,
+                                  f_p, f_m, jw_p, jw_m, length, area_p, area_m,
+                                  free_p, free_m, tris, verts,
+                                  quad_pts, quad_wts, ik_re, ik_im, ik_inv_re, ik_inv_im,
+                                  inv4pi):
+        """Apply singular corrections in parallel over test functions m."""
+        Nq = len(quad_wts)
+        for m in prange(N):
+            for t_half in range(2):
+                if t_half == 0:
+                    t_f = f_p[m]; t_div = div_p[m]; t_jw = jw_p[m]; t_tri = tri_p[m]
+                else:
+                    t_f = f_m[m]; t_div = div_m[m]; t_jw = jw_m[m]; t_tri = tri_m[m]
+                t0 = tris[t_tri, 0]; t1_idx = tris[t_tri, 1]; t2 = tris[t_tri, 2]
+                tv0 = verts[t0]; tv1 = verts[t1_idx]; tv2 = verts[t2]
+                # Compute P and V at quad points for this triangle
+                lam0_arr = 1.0 - quad_pts[:, 0] - quad_pts[:, 1]
+                P_vals = np.zeros(Nq)
+                V_vals = np.zeros((Nq, 3))
+                for iq in range(Nq):
+                    rq = lam0_arr[iq] * tv0 + quad_pts[iq, 0] * tv1 + quad_pts[iq, 1] * tv2
+                    P_vals[iq] = _potential_integral_nb(rq, tv0, tv1, tv2)
+                    V_vals[iq] = _vector_potential_nb(rq, tv0, tv1, tv2, quad_pts, quad_wts)
+                # scalar_base = dot(P_vals, t_jw) * inv4pi
+                scalar_base = 0.0
+                for iq in range(Nq):
+                    scalar_base += P_vals[iq] * t_jw[iq]
+                scalar_base *= inv4pi
+                # Loop over source basis functions on same triangle
+                for n in range(N):
+                    for s_half in range(2):
+                        if s_half == 0:
+                            s_tri = tri_p[n]
+                        else:
+                            s_tri = tri_m[n]
+                        if s_tri != t_tri:
+                            continue
+                        if s_half == 0:
+                            s_div = div_p[n]
+                            s_coeff = length[n] / (2.0 * area_p[n])
+                            s_free = free_p[n]
+                            s_sign = 1.0
+                        else:
+                            s_div = div_m[n]
+                            s_coeff = length[n] / (2.0 * area_m[n])
+                            s_free = free_m[n]
+                            s_sign = -1.0
+                        # L_sing_scalar = -ik_inv * t_div * s_div * scalar_base
+                        ls_re = -(ik_inv_re * t_div * s_div * scalar_base)
+                        ls_im = -(ik_inv_im * t_div * s_div * scalar_base)
+                        # vec_integral = sum(sum(t_f * fn_over_R, axis=1) * t_jw) * inv4pi
+                        vec_re = 0.0
+                        for iq in range(Nq):
+                            fn0 = s_sign * s_coeff * (V_vals[iq, 0] - s_free[0] * P_vals[iq])
+                            fn1 = s_sign * s_coeff * (V_vals[iq, 1] - s_free[1] * P_vals[iq])
+                            fn2 = s_sign * s_coeff * (V_vals[iq, 2] - s_free[2] * P_vals[iq])
+                            dot_val = t_f[iq, 0]*fn0 + t_f[iq, 1]*fn1 + t_f[iq, 2]*fn2
+                            vec_re += dot_val * t_jw[iq]
+                        vec_re *= inv4pi
+                        # L[m, n] += L_sing_scalar + ik * vec_integral
+                        L_re[m, n] += ls_re + ik_re * vec_re
+                        L_im[m, n] += ls_im + ik_im * vec_re
+        return L_re, L_im
 
 
 # ============================================================
@@ -574,63 +944,74 @@ def assemble_L_K(rwg, verts, tris, k, quad_order=7):
     # --- Singular corrections (analytical G_0 part for L) ---
     t1 = time.time()
 
-    # Cache triangle vertices
-    tri_verts_cache = {}
-    for ti in range(len(tris)):
-        tri_verts_cache[ti] = (verts[tris[ti, 0]].copy(),
-                                verts[tris[ti, 1]].copy(),
-                                verts[tris[ti, 2]].copy())
-
-    # Build triangle → RWG half map for efficient lookup
-    tri_to_rwg_p = {}  # tri_idx → list of (rwg_idx, div, coeff, free, sign)
-    tri_to_rwg_m = {}
-    for n in range(N):
-        tp = rwg['tri_p'][n]
-        if tp not in tri_to_rwg_p:
-            tri_to_rwg_p[tp] = []
-        tri_to_rwg_p[tp].append((n, div_p[n],
-                                  rwg['length'][n] / (2 * rwg['area_p'][n]),
-                                  rwg['free_p'][n], +1))
-        tm = rwg['tri_m'][n]
-        if tm not in tri_to_rwg_m:
-            tri_to_rwg_m[tm] = []
-        tri_to_rwg_m[tm].append((n, div_m[n],
-                                  rwg['length'][n] / (2 * rwg['area_m'][n]),
-                                  rwg['free_m'][n], -1))
-
-    # Precompute analytical integrals P and V for each unique triangle
-    tri_PV_cache = {}  # tri_idx → (P_vals, V_vals)
-    all_sing_tris = set(tri_to_rwg_p.keys()) | set(tri_to_rwg_m.keys())
-    for tri_idx in all_sing_tris:
-        tv = tri_verts_cache[tri_idx]
-        t = tris[tri_idx]
-        v0, v1, v2 = verts[t[0]], verts[t[1]], verts[t[2]]
-        tri_qpts = lam0[:, None] * v0 + quad_pts[:, 0:1] * v1 + quad_pts[:, 1:2] * v2
-        P = np.zeros(Nq)
-        V = np.zeros((Nq, 3))
-        for iq in range(Nq):
-            P[iq] = potential_integral_triangle(tri_qpts[iq], *tv)
-            V[iq] = vector_potential_integral_triangle(tri_qpts[iq], *tv)
-        tri_PV_cache[tri_idx] = (P, V)
-
-    # Apply singular corrections
-    for m in range(N):
-        for t_f_h, t_div_h, t_jw_h, t_tri_idx in [
-            (f_p[m], div_p[m], jw_p[m], rwg['tri_p'][m]),
-            (f_m[m], div_m[m], jw_m[m], rwg['tri_m'][m]),
-        ]:
-            P_vals, V_vals = tri_PV_cache[t_tri_idx]
-            scalar_base = np.dot(P_vals, t_jw_h) * inv4pi
-
-            # Source halves on the same triangle
-            for src_dict in [tri_to_rwg_p, tri_to_rwg_m]:
-                if t_tri_idx not in src_dict:
-                    continue
-                for n, src_div_val, src_coeff, src_free, src_sign in src_dict[t_tri_idx]:
-                    L_sing_scalar = -ik_inv * t_div_h * src_div_val * scalar_base
-                    fn_over_R = src_sign * src_coeff * (V_vals - src_free[None, :] * P_vals[:, None])
-                    vec_integral = np.sum(np.sum(t_f_h * fn_over_R, axis=1) * t_jw_h) * inv4pi
-                    L[m, n] += L_sing_scalar + ik * vec_integral
+    if HAS_NUMBA:
+        # Numba-accelerated parallel singular corrections
+        L_re = np.real(L).copy()
+        L_im = np.imag(L).copy()
+        ik_val = complex(ik)
+        ik_inv_val = complex(ik_inv)
+        _singular_corrections_nb(
+            L_re, L_im, N,
+            rwg['tri_p'].astype(np.int64), rwg['tri_m'].astype(np.int64),
+            div_p, div_m, f_p, f_m, jw_p, jw_m,
+            rwg['length'], rwg['area_p'], rwg['area_m'],
+            rwg['free_p'], rwg['free_m'],
+            tris.astype(np.int64), verts,
+            quad_pts, quad_wts,
+            ik_val.real, ik_val.imag,
+            ik_inv_val.real, ik_inv_val.imag,
+            inv4pi)
+        L = L_re + 1j * L_im
+    else:
+        # Pure Python fallback
+        tri_verts_cache = {}
+        for ti in range(len(tris)):
+            tri_verts_cache[ti] = (verts[tris[ti, 0]].copy(),
+                                    verts[tris[ti, 1]].copy(),
+                                    verts[tris[ti, 2]].copy())
+        tri_to_rwg_p = {}
+        tri_to_rwg_m = {}
+        for n in range(N):
+            tp = rwg['tri_p'][n]
+            if tp not in tri_to_rwg_p:
+                tri_to_rwg_p[tp] = []
+            tri_to_rwg_p[tp].append((n, div_p[n],
+                                      rwg['length'][n] / (2 * rwg['area_p'][n]),
+                                      rwg['free_p'][n], +1))
+            tm = rwg['tri_m'][n]
+            if tm not in tri_to_rwg_m:
+                tri_to_rwg_m[tm] = []
+            tri_to_rwg_m[tm].append((n, div_m[n],
+                                      rwg['length'][n] / (2 * rwg['area_m'][n]),
+                                      rwg['free_m'][n], -1))
+        tri_PV_cache = {}
+        all_sing_tris = set(tri_to_rwg_p.keys()) | set(tri_to_rwg_m.keys())
+        for tri_idx in all_sing_tris:
+            tv = tri_verts_cache[tri_idx]
+            t = tris[tri_idx]
+            v0, v1, v2 = verts[t[0]], verts[t[1]], verts[t[2]]
+            tri_qpts = lam0[:, None] * v0 + quad_pts[:, 0:1] * v1 + quad_pts[:, 1:2] * v2
+            P = np.zeros(Nq)
+            V = np.zeros((Nq, 3))
+            for iq in range(Nq):
+                P[iq] = potential_integral_triangle(tri_qpts[iq], *tv)
+                V[iq] = vector_potential_integral_triangle(tri_qpts[iq], *tv)
+            tri_PV_cache[tri_idx] = (P, V)
+        for m in range(N):
+            for t_f_h, t_div_h, t_jw_h, t_tri_idx in [
+                (f_p[m], div_p[m], jw_p[m], rwg['tri_p'][m]),
+                (f_m[m], div_m[m], jw_m[m], rwg['tri_m'][m]),
+            ]:
+                P_vals, V_vals = tri_PV_cache[t_tri_idx]
+                scalar_base = np.dot(P_vals, t_jw_h) * inv4pi
+                for src_dict in [tri_to_rwg_p, tri_to_rwg_m]:
+                    if t_tri_idx not in src_dict:
+                        continue
+                    for n, src_div_val, src_coeff, src_free, src_sign in src_dict[t_tri_idx]:
+                        L_sing_scalar = -ik_inv * t_div_h * src_div_val * scalar_base
+                        fn_over_R = src_sign * src_coeff * (V_vals - src_free[None, :] * P_vals[:, None])
+                        vec_integral = np.sum(np.sum(t_f_h * fn_over_R, axis=1) * t_jw_h) * inv4pi
+                        L[m, n] += L_sing_scalar + ik * vec_integral
 
     elapsed_sing = time.time() - t1
     print(f"    Singular corrections: {elapsed_sing:.1f}s")
@@ -1351,3 +1732,411 @@ def compute_rhs_planewave_snc(rwg, verts, tris, k_ext, eta_ext,
         b[:N] += np.sum(np.einsum('nqi,i->nq', nxf, E0) * phase * jw, axis=1)
         b[N:] += np.sum(np.einsum('nqi,i->nq', nxf, H0) * phase * jw, axis=1)
     return b
+
+
+# ============================================================
+# 12. Multi-body BEM for particle clusters
+# ============================================================
+
+def merge_meshes(bodies):
+    """Merge multiple particle meshes into one.
+
+    Parameters
+    ----------
+    bodies : list of dict
+        Each dict has keys:
+        - 'verts': ndarray (V, 3) — vertex positions
+        - 'tris': ndarray (T, 3) — triangle indices
+        - 'k_int': float/complex — interior wavenumber
+        - 'eta_int': float/complex — interior impedance
+
+    Returns
+    -------
+    verts : ndarray — merged vertex array
+    tris : ndarray — merged triangle array
+    body_ranges : list of (tri_start, tri_end) — triangle ranges per body
+    """
+    all_verts = []
+    all_tris = []
+    body_ranges = []
+    vert_offset = 0
+    tri_offset = 0
+
+    for body in bodies:
+        v = body['verts']
+        t = body['tris']
+        all_verts.append(v)
+        all_tris.append(t + vert_offset)
+        body_ranges.append((tri_offset, tri_offset + len(t)))
+        vert_offset += len(v)
+        tri_offset += len(t)
+
+    return np.vstack(all_verts), np.vstack(all_tris).astype(np.int32), body_ranges
+
+
+def assemble_multibody_pmchwt(bodies, k_ext, eta_ext, quad_order=7):
+    """Assemble PMCHWT system for a cluster of dielectric particles.
+
+    Each particle has its own interior (k_int, eta_int), but they all share
+    the same exterior medium (k_ext, eta_ext). The coupling between particles
+    is through the exterior Green's function only.
+
+    Parameters
+    ----------
+    bodies : list of dict
+        Each dict has keys:
+        - 'verts': ndarray (V, 3)
+        - 'tris': ndarray (T, 3)
+        - 'k_int': float/complex
+        - 'eta_int': float/complex
+    k_ext : float
+        Exterior wavenumber.
+    eta_ext : float
+        Exterior impedance.
+    quad_order : int
+        Quadrature order.
+
+    Returns
+    -------
+    Z : ndarray (2N_total, 2N_total) — PMCHWT system matrix
+    rwg_list : list of dict — RWG data for each body
+    rwg_merged : dict — merged RWG data
+    verts : ndarray — merged vertices
+    tris : ndarray — merged triangles
+    body_rwg_ranges : list of (start, end) — RWG index ranges per body
+    """
+    import time as _t
+
+    # Merge meshes
+    verts, tris, body_tri_ranges = merge_meshes(bodies)
+
+    # Build RWG for merged mesh
+    rwg = build_rwg(verts, tris)
+    N = rwg['N']
+    print(f"  Multi-body: {len(bodies)} particles, {len(tris)} tris, {N} RWG total")
+
+    # Determine which RWG basis belongs to which body
+    # An RWG edge belongs to body i if its tri_p falls in body i's triangle range
+    body_rwg_ranges = []
+    rwg_body = np.zeros(N, dtype=int)
+    for bi, (t_start, t_end) in enumerate(body_tri_ranges):
+        mask = (rwg['tri_p'] >= t_start) & (rwg['tri_p'] < t_end)
+        rwg_body[mask] = bi
+        indices = np.where(mask)[0]
+        if len(indices) > 0:
+            body_rwg_ranges.append((indices[0], indices[-1] + 1))
+        else:
+            body_rwg_ranges.append((0, 0))
+
+    # Assemble exterior operators (full N×N coupling)
+    t0 = _t.time()
+    print(f"  Assembling exterior operators (k_ext={k_ext:.4f})...")
+    L_ext, K_ext = assemble_L_K(rwg, verts, tris, k_ext, quad_order=quad_order)
+    print(f"  Exterior assembly: {_t.time()-t0:.1f}s")
+
+    # Build system matrix
+    Z = np.zeros((2*N, 2*N), dtype=complex)
+
+    # Exterior contribution (couples ALL bodies)
+    Z[:N, :N] += eta_ext * L_ext
+    Z[:N, N:] += -K_ext
+    Z[N:, :N] += K_ext
+    Z[N:, N:] += L_ext / eta_ext
+
+    # Interior contribution (block-diagonal, each body independent)
+    for bi, body in enumerate(bodies):
+        rng = body_rwg_ranges[bi]
+        n_start, n_end = rng
+        n_bi = n_end - n_start
+
+        if n_bi == 0:
+            continue
+
+        k_int = body['k_int']
+        eta_int = body['eta_int']
+
+        # Build RWG for this body alone
+        body_verts = body['verts']
+        body_tris = body['tris']
+        body_rwg = build_rwg(body_verts, body_tris)
+
+        t1 = _t.time()
+        print(f"  Assembling interior operators body {bi} "
+              f"(k_int={k_int}, {n_bi} RWG)...")
+        L_int, K_int = assemble_L_K(body_rwg, body_verts, body_tris, k_int,
+                                      quad_order=quad_order)
+        print(f"  Interior assembly body {bi}: {_t.time()-t1:.1f}s")
+
+        # Add interior contribution (block-diagonal)
+        s = slice(n_start, n_end)
+        Z[s, s] += eta_int * L_int
+        Z[s, N+n_start:N+n_end] += K_int
+        Z[N+n_start:N+n_end, s] += -K_int
+        Z[N+n_start:N+n_end, N+n_start:N+n_end] += L_int / eta_int
+
+    return Z, rwg, verts, tris, body_rwg_ranges
+
+
+def compute_rhs_multibody(rwg, verts, tris, k_ext, eta_ext,
+                            E0=None, k_hat=None, quad_order=7):
+    """Compute RHS for multi-body PMCHWT (same as single-body)."""
+    return compute_rhs_planewave(rwg, verts, tris, k_ext, eta_ext,
+                                  E0=E0, k_hat=k_hat, quad_order=quad_order)
+
+
+# ============================================================
+# 13. H-matrix compression with ACA for O(N log N) matvec
+# ============================================================
+
+class HMatrix:
+    """Hierarchical matrix using Adaptive Cross Approximation (ACA).
+
+    Splits the Z matrix into near-field (dense) and far-field (low-rank)
+    blocks based on basis function separation. Far-field blocks are compressed
+    using ACA to rank-k approximations U·V^H.
+
+    This enables O(N log N) matrix-vector products instead of O(N²).
+    """
+
+    def __init__(self, Z, rwg, verts, tris, eta=3.0, aca_tol=1e-4, max_rank=50):
+        """Build H-matrix from dense matrix Z.
+
+        Parameters
+        ----------
+        Z : ndarray (M, M) — full system matrix (2N×2N for PMCHWT)
+        rwg : dict — RWG basis function data
+        verts, tris : ndarray — mesh data
+        eta : float — admissibility parameter (block is far-field if
+              dist(cluster_i, cluster_j) > eta * max(diam_i, diam_j))
+        aca_tol : float — ACA approximation tolerance
+        max_rank : int — maximum rank for low-rank blocks
+        """
+        self.M = Z.shape[0]
+        self.dtype = Z.dtype
+        N = rwg['N']
+
+        # Compute RWG centroids for clustering
+        centroids = np.zeros((N, 3))
+        for n in range(N):
+            tp = rwg['tri_p'][n]; tm = rwg['tri_m'][n]
+            cp = verts[tris[tp]].mean(axis=0)
+            cm = verts[tris[tm]].mean(axis=0)
+            centroids[n] = 0.5 * (cp + cm)
+
+        # For PMCHWT (2N×2N), J and M share same spatial locations
+        is_pmchwt = (self.M == 2 * N)
+        if is_pmchwt:
+            full_centroids = np.vstack([centroids, centroids])
+        else:
+            full_centroids = centroids
+
+        # Build block structure using bisection clustering
+        block_size = max(32, N // 16)
+        self.blocks = []
+        self._build_blocks(Z, full_centroids, block_size, eta, aca_tol, max_rank)
+
+        # Statistics
+        dense_entries = sum(b['rows'] * b['cols'] for b in self.blocks if b['type'] == 'dense')
+        lr_entries = sum(b['rank'] * (b['rows'] + b['cols']) for b in self.blocks if b['type'] == 'lr')
+        total = self.M * self.M
+        ratio = (dense_entries + lr_entries) / total
+        avg_rank = np.mean([b['rank'] for b in self.blocks if b['type'] == 'lr']) if any(b['type'] == 'lr' for b in self.blocks) else 0
+        print(f"  H-matrix: {len(self.blocks)} blocks, "
+              f"compression {ratio:.1%}, avg rank {avg_rank:.0f}")
+
+    def _build_blocks(self, Z, centroids, block_size, eta, aca_tol, max_rank):
+        """Recursively partition matrix into near/far-field blocks."""
+        M = self.M
+        # Simple 1D partition by spatial coordinate (longest axis)
+        indices = np.arange(M)
+        self._partition_recursive(Z, centroids, indices, indices,
+                                   block_size, eta, aca_tol, max_rank)
+
+    def _partition_recursive(self, Z, centroids, row_idx, col_idx,
+                              block_size, eta, aca_tol, max_rank):
+        nr = len(row_idx); nc = len(col_idx)
+
+        if nr <= block_size or nc <= block_size:
+            # Leaf block — check admissibility
+            if self._is_admissible(centroids, row_idx, col_idx, eta):
+                # Far-field: ACA compression
+                self._add_lr_block(Z, row_idx, col_idx, aca_tol, max_rank)
+            else:
+                # Near-field: store dense
+                self._add_dense_block(Z, row_idx, col_idx)
+            return
+
+        # Check admissibility before splitting
+        if self._is_admissible(centroids, row_idx, col_idx, eta):
+            self._add_lr_block(Z, row_idx, col_idx, aca_tol, max_rank)
+            return
+
+        # Split along longest axis
+        row_split = self._bisect(centroids, row_idx)
+        col_split = self._bisect(centroids, col_idx)
+
+        for ri in row_split:
+            for ci in col_split:
+                self._partition_recursive(Z, centroids, ri, ci,
+                                           block_size, eta, aca_tol, max_rank)
+
+    def _bisect(self, centroids, indices):
+        """Split indices into two groups along longest spatial axis."""
+        pts = centroids[indices]
+        span = pts.max(axis=0) - pts.min(axis=0)
+        axis = np.argmax(span)
+        median = np.median(pts[:, axis])
+        mask = pts[:, axis] <= median
+        idx1 = indices[mask]
+        idx2 = indices[~mask]
+        if len(idx1) == 0: idx1 = indices[:1]; idx2 = indices[1:]
+        if len(idx2) == 0: idx1 = indices[:-1]; idx2 = indices[-1:]
+        return [idx1, idx2]
+
+    def _is_admissible(self, centroids, row_idx, col_idx, eta):
+        """Check if block is admissible (far-field)."""
+        r_pts = centroids[row_idx]; c_pts = centroids[col_idx]
+        r_center = r_pts.mean(axis=0); c_center = c_pts.mean(axis=0)
+        dist = np.linalg.norm(r_center - c_center)
+        r_diam = np.max(np.linalg.norm(r_pts - r_center, axis=1)) * 2
+        c_diam = np.max(np.linalg.norm(c_pts - c_center, axis=1)) * 2
+        return dist > eta * max(r_diam, c_diam, 1e-15)
+
+    def _add_dense_block(self, Z, row_idx, col_idx):
+        self.blocks.append({
+            'type': 'dense',
+            'row_idx': row_idx,
+            'col_idx': col_idx,
+            'data': Z[np.ix_(row_idx, col_idx)].copy(),
+            'rows': len(row_idx),
+            'cols': len(col_idx),
+        })
+
+    def _add_lr_block(self, Z, row_idx, col_idx, tol, max_rank):
+        """ACA with partial pivoting."""
+        nr = len(row_idx); nc = len(col_idx)
+        max_k = min(max_rank, min(nr, nc))
+
+        U = np.zeros((nr, max_k), dtype=self.dtype)
+        V = np.zeros((max_k, nc), dtype=self.dtype)
+
+        used_rows = set()
+        pivot_row = 0
+        rank = 0
+        ref_norm = 0.0
+
+        for k in range(max_k):
+            # Get row of residual
+            row = Z[row_idx[pivot_row], col_idx].copy()
+            for j in range(rank):
+                row -= U[pivot_row, j] * V[j, :]
+
+            # Find pivot column
+            pivot_col = np.argmax(np.abs(row))
+            if abs(row[pivot_col]) < 1e-15:
+                break
+
+            # Get column of residual
+            col = Z[row_idx, col_idx[pivot_col]].copy()
+            for j in range(rank):
+                col -= U[:, j] * V[j, pivot_col]
+
+            # Update
+            V[rank, :] = row / row[pivot_col]
+            U[:, rank] = col
+            rank += 1
+
+            # Check convergence
+            uv_norm = np.linalg.norm(col) * np.linalg.norm(row) / abs(row[pivot_col])
+            ref_norm += uv_norm
+            if uv_norm < tol * ref_norm and rank > 1:
+                break
+
+            # Next pivot row
+            used_rows.add(pivot_row)
+            residual_col = np.abs(col)
+            for r in used_rows:
+                residual_col[r] = 0
+            pivot_row = np.argmax(residual_col)
+
+        self.blocks.append({
+            'type': 'lr',
+            'row_idx': row_idx,
+            'col_idx': col_idx,
+            'U': U[:, :rank].copy(),
+            'V': V[:rank, :].copy(),
+            'rank': rank,
+            'rows': nr,
+            'cols': nc,
+        })
+
+    def matvec(self, x):
+        """Matrix-vector product y = Z·x using H-matrix."""
+        y = np.zeros(self.M, dtype=self.dtype)
+        for block in self.blocks:
+            xb = x[block['col_idx']]
+            if block['type'] == 'dense':
+                y[block['row_idx']] += block['data'] @ xb
+            else:
+                y[block['row_idx']] += block['U'] @ (block['V'] @ xb)
+        return y
+
+    def memory_bytes(self):
+        """Estimate memory usage in bytes."""
+        total = 0
+        for b in self.blocks:
+            if b['type'] == 'dense':
+                total += b['rows'] * b['cols'] * 16  # complex128
+            else:
+                total += b['rank'] * (b['rows'] + b['cols']) * 16
+        return total
+
+
+def solve_hmatrix_gmres(Z_hmat, b, tol=1e-6, maxiter=200, Z_diag_blocks=None):
+    """Solve Z·x = b using GMRES with H-matrix matvec.
+
+    Parameters
+    ----------
+    Z_hmat : HMatrix
+        H-matrix approximation of Z.
+    b : ndarray
+        Right-hand side.
+    tol : float
+        GMRES tolerance.
+    maxiter : int
+        Maximum iterations.
+    Z_diag_blocks : list of ndarray, optional
+        Dense diagonal blocks for block-diagonal preconditioner.
+
+    Returns
+    -------
+    x : ndarray — solution vector
+    """
+    from scipy.sparse.linalg import LinearOperator, gmres
+
+    M = Z_hmat.M
+    A = LinearOperator((M, M), matvec=Z_hmat.matvec, dtype=Z_hmat.dtype)
+
+    precond = None
+    if Z_diag_blocks is not None:
+        # Block-diagonal preconditioner from dense diagonal blocks
+        lu_blocks = [linalg.lu_factor(blk) for blk in Z_diag_blocks]
+        sizes = [blk.shape[0] for blk in Z_diag_blocks]
+        offsets = np.cumsum([0] + sizes)
+
+        def precond_matvec(r):
+            y = np.empty(M, dtype=complex)
+            for i, lu in enumerate(lu_blocks):
+                s = slice(offsets[i], offsets[i+1])
+                y[s] = linalg.lu_solve(lu, r[s])
+            return y
+        precond = LinearOperator((M, M), matvec=precond_matvec, dtype=complex)
+
+    iters = [0]
+    def callback(pr_norm):
+        iters[0] += 1
+
+    x, info = gmres(A, b, rtol=tol, maxiter=maxiter, M=precond,
+                     callback=callback, callback_type='pr_norm')
+    print(f"  H-matrix GMRES: {iters[0]} iterations, info={info}")
+    return x
