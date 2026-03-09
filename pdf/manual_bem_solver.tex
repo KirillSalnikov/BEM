@@ -714,22 +714,41 @@ M = compute_mueller_matrix(rwg, verts, tris, k_ext, eta_ext,
 
 Общее число ориентаций: $n_\alpha \times n_\beta \times n_\gamma$. Для каждой --- 2 решения (2 поляризации).
 
-\subsection{Ключевые детали реализации}
+\subsection{Почему матрицу $Z$ не нужно пересобирать}
 
+Ключевое наблюдение: матрица $Z$ зависит только от \textbf{геометрии частицы} (форма, $m$, $k$), но \textbf{не от направления падения} $\hat{\mathbf{k}}$ и поляризации $\mathbf{E}_0$. Направление и поляризация входят только в правую часть $\mathbf{b}$.
+
+Поэтому при усреднении по $N_{\mathrm{or}}$ ориентациям:
+\begin{itemize}
+  \item \textbf{Без оптимизации}: $N_{\mathrm{or}}$ раз решить $Z \mathbf{x} = \mathbf{b}_i$ (каждый раз $O(N^3)$ LU) $\Rightarrow$ общая стоимость $O(N_{\mathrm{or}} \cdot N^3)$.
+  \item \textbf{С LU-факторизацией}: факторизовать $Z = PLU$ \textbf{один раз} ($O(N^3)$), затем для каждой ориентации --- только обратная подстановка $O(N^2)$. Общая стоимость: $O(N^3 + N_{\mathrm{or}} \cdot N^2)$.
+\end{itemize}
+
+При $N_{\mathrm{or}} = 1000$ и $N = 2000$ это ускорение в $\sim$1000 раз на этапе решения.
+
+\subsection{Наивная vs батчевая реализация}
+
+\textbf{Наивная версия} (\texttt{orientation\_average\_mueller}):
 \begin{enumerate}
-  \item Матрица $Z$ факторизуется LU \textbf{один раз}. Для каждой ориентации пересчитывается только правая часть $b$ (зависит от $\hat{\mathbf{k}}$ и $\mathbf{E}_0$) и решение --- обратная подстановка $O(N^2)$.
-  \item Направление падения вращается: $\hat{\mathbf{k}} = R(\alpha,\beta,\gamma) \cdot \hat{\mathbf{z}}$.
-  \item Направления наблюдения --- в плоскости рассеяния текущего $\hat{\mathbf{k}}$.
+  \item Цикл по $N_{\mathrm{or}}$ ориентациям в Python
+  \item Для каждой: собрать $\mathbf{b}_i$ $\to$ \texttt{lu\_solve(Z\_lu, b\_i)} $\to$ посчитать дальнее поле $\to$ матрицу Мюллера
+  \item Каждый вызов \texttt{lu\_solve} решает систему $2N \times 2N$ для одного вектора
 \end{enumerate}
 
-\subsection{Батчевая версия}
-
-Функция \texttt{orientation\_average\_mueller\_batched} --- оптимизированная версия:
+\textbf{Батчевая версия} (\texttt{orientation\_average\_mueller\_batched}):
 \begin{enumerate}
-  \item Все правые части собираются в матрицу $B$ размера $2N \times 2 N_{\mathrm{orient}}$
-  \item \textbf{Один вызов} \texttt{lu\_solve(Z\_lu, B)} --- LAPACK \texttt{dtrsm} для множественных RHS (BLAS-3)
-  \item Ускорение шага решения: $\sim$9.4$\times$
+  \item Сначала собрать \textbf{все} правые части в матрицу $B$ размера $2N \times 2 N_{\mathrm{or}}$:
+  \begin{equation}
+    B = [\mathbf{b}_1^{\parallel}, \mathbf{b}_1^{\perp}, \mathbf{b}_2^{\parallel}, \mathbf{b}_2^{\perp}, \ldots, \mathbf{b}_{N_{\mathrm{or}}}^{\parallel}, \mathbf{b}_{N_{\mathrm{or}}}^{\perp}]
+  \end{equation}
+  (по 2 столбца на ориентацию --- две поляризации)
+  \item \textbf{Один вызов} \texttt{lu\_solve(Z\_lu, B)} --- LAPACK решает $2 N_{\mathrm{or}}$ систем за раз
+  \item Затем цикл по ориентациям только для дальнего поля (лёгкие операции)
 \end{enumerate}
+
+\textbf{Почему батч быстрее?} LAPACK-функция \texttt{dtrsv} (один вектор) работает с памятью побайтово --- ограничена пропускной способностью памяти (memory-bound). Функция \texttt{dtrsm} (матрица правых частей) обрабатывает блоки столбцов, используя кеш-линии и BLAS Level-3 (матрица$\times$матрица вместо матрица$\times$вектор). Соотношение вычислений к обращениям к памяти растёт с $O(1)$ до $O(B)$, где $B$ --- число столбцов в блоке.
+
+\textbf{Результат}: шаг решения ускоряется в $\sim$9.4$\times$ при 1024 ориентациях ($N = 1920$). Общее ускорение меньше, т.к. сборка правых частей и дальнее поле остаются последовательными.
 
 \begin{lstlisting}
 from bem_core import orientation_average_mueller_batched
