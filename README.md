@@ -371,6 +371,66 @@ M_avg = orientation_average_mueller(rwg, verts, tris, k_ext, eta_ext, theta,
 # M_avg[0,1,:] / M_avg[0,0,:] = degree of linear polarization
 ```
 
+## OpenCL Acceleration
+
+The optional module `bem_opencl.py` provides GPU/CPU-accelerated assembly and GMRES solver using OpenCL with float32 kernels (optimal for consumer GPUs like AMD RDNA 4 with 1/32 fp64 rate).
+
+### Installation
+
+```bash
+pip install pyopencl
+```
+
+**CPU OpenCL runtime** (works without a GPU):
+```bash
+# Ubuntu/Debian
+sudo apt-get install pocl-opencl-icd
+
+# or via conda
+conda install -c conda-forge pocl
+```
+
+**AMD GPU (ROCm)**:
+```bash
+sudo apt-get install rocm-opencl-runtime
+```
+
+**NVIDIA GPU**:
+```bash
+sudo apt-get install nvidia-opencl-icd
+```
+
+Verify installation:
+```bash
+python -c "import pyopencl; print(pyopencl.get_platforms())"
+```
+
+### Usage
+
+Drop-in replacements for the CPU functions:
+
+```python
+from bem_opencl import assemble_pmchwt_ocl, solve_gmres_ocl
+
+# Assemble on GPU (float32 kernels, singular corrections on CPU in float64)
+Z = assemble_pmchwt_ocl(rwg, verts, tris, k_ext, k_int, eta_ext, eta_int)
+
+# RHS (same as CPU version)
+from bem_core import compute_rhs_planewave
+b = compute_rhs_planewave(rwg, verts, tris, k_ext, eta_ext)
+
+# GMRES with GPU matvec + block-diagonal preconditioner
+coeffs = solve_gmres_ocl(Z, b, tol=1e-6, maxiter=200)
+```
+
+### Performance (ref=3, 1920 RWG basis functions)
+
+| Backend | Assembly | GMRES | Total |
+|---|---|---|---|
+| NumPy (CPU) | 87 s | 7 s | 94 s |
+| POCL (CPU OpenCL) | 12.6 s | 2.5 s | 15 s |
+| GPU (estimated) | ~1 s | ~0.3 s | ~2 s |
+
 ## Validation
 
 Tested against Mie theory for:
