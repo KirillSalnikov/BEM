@@ -146,6 +146,53 @@ $m$ & $n + i\kappa$ & Комплексный показатель преломл
   \item $\mathcal{K}$ --- связан с магнитным полем (MFIE)
 \end{itemize}
 
+\subsection{Почему скалярное ядро, а не тензорное?}
+\label{sec:dyadic}
+
+На первый взгляд кажется, что скалярная функция Грина $G = e^{ikR}/(4\pi R)$ не может менять поляризацию рассеянного поля: она умножает вектор тока на скаляр, сохраняя его направление. Однако операторы $\mathcal{L}$ и $\mathcal{K}$ на самом деле \textbf{тензорные}, несмотря на скалярную $G$.
+
+\paragraph{Диадная функция Грина.}
+Уравнения Максвелла для рассеянного поля имеют решение через \textbf{диадную} (тензорную) функцию Грина~[13, глава~8]:
+\begin{equation}
+  \bar{\bar{G}}(\mathbf{r},\mathbf{r}') = \left(\bar{\bar{I}} + \frac{\nabla\nabla}{k^2}\right) G(\mathbf{r},\mathbf{r}')
+\end{equation}
+где $\bar{\bar{I}}$ --- единичный тензор ($3\times3$ единичная матрица), а $\nabla\nabla G$ --- тензор второго ранга с компонентами $\partial^2 G / \partial x_i \partial x_j$.
+
+Именно член $\nabla\nabla G / k^2$ перемешивает компоненты поляризации: даже если ток $\mathbf{J}$ направлен по $x$, результат $\bar{\bar{G}} \cdot \mathbf{J}$ имеет компоненты по $x$, $y$ и $z$.
+
+\paragraph{Связь с оператором $\mathcal{L}$.}
+Действие диадной функции Грина на ток:
+\begin{equation}
+  \bar{\bar{G}} \cdot \mathbf{J} = G \cdot \mathbf{J} + \frac{1}{k^2} \nabla(\nabla \cdot [G \mathbf{J}])
+\end{equation}
+После интегрирования по поверхности и интегрирования по частям (перебрасывания $\nabla'$ на $\mathbf{J}$) получаем в точности оператор $\mathcal{L}$:
+\begin{equation}
+  \mathcal{L}[\mathbf{J}] = ik \underbrace{\int_S G \, \mathbf{J} \, dS'}_{\text{векторный потенциал } \mathbf{A}}
+  + \frac{i}{k} \underbrace{\nabla \int_S G \, \nabla'\!\cdot\mathbf{J} \, dS'}_{\text{градиент скалярного потенциала } -\nabla\Phi}
+\end{equation}
+
+\begin{itemize}
+  \item \textbf{Первый член} ($\sim\!\mathbf{A}$): скалярная $G$ умножает вектор $\mathbf{J}$; поляризация сохраняется.
+  \item \textbf{Второй член} ($\sim\!{-\nabla\Phi}$): интеграл $\int G\,\nabla'\!\cdot\mathbf{J}\,dS'$ --- скаляр (потенциал $\Phi$), но его \textbf{градиент} направлен произвольно --- не вдоль $\mathbf{J}$, а вдоль $\nabla_{\mathbf{r}}$ в точке наблюдения. Именно этот член вносит тензорную структуру и перемешивает компоненты поля.
+\end{itemize}
+
+Таким образом, записывая ядро через скалярную $G$ вместо тензорной $\bar{\bar{G}}$, мы не теряем физику --- тензорная структура перенесена на дифференциальные операторы ($\nabla$, $\nabla\cdot$), а после дискретизации методом Галёркина --- на базисные функции и их дивергенции.
+
+\paragraph{Оператор $\mathcal{K}$ --- явное вращение поляризации.}
+Оператор
+\begin{equation}
+  \mathcal{K}[\mathbf{J}] = \int_S \nabla G \times \mathbf{J} \, dS'
+\end{equation}
+содержит \textbf{векторное произведение} $\nabla G \times \mathbf{J}$, которое по определению поворачивает вектор: результат перпендикулярен и $\nabla G$, и $\mathbf{J}$. Если $\mathbf{J} \| \hat{\mathbf{x}}$, а $\nabla G \| \hat{\mathbf{z}}$, то $\nabla G \times \mathbf{J} \| \hat{\mathbf{y}}$ --- поляризация повернулась на 90°. Кроме того, $\mathcal{K}$ связывает электрические токи с магнитным полем и наоборот (через PMCHWT), обеспечивая полный механизм изменения поляризации при рассеянии.
+
+\paragraph{Переход к дискретной форме.}
+После проекции на RWG-базис (метод Галёркина~[1,13]) тензорный член $\nabla\nabla G$ превращается в скалярный div-div:
+\begin{equation}
+  \int_S\!\int_S \mathbf{f}_m \cdot \left(\frac{\nabla\nabla G}{k^2}\right) \cdot \mathbf{f}_n \, dS\,dS'
+  \;=\; \frac{1}{k^2}\int_S\!\int_S (\nabla_s\!\cdot\mathbf{f}_m)(\nabla'_s\!\cdot\mathbf{f}_n) \, G \, dS\,dS'
+\end{equation}
+Тензорная структура <<спрятана>> в дивергенциях базисных функций $\nabla_s\!\cdot\mathbf{f}_n = \pm l_n/A_n^\pm$, которые являются скалярами. Благодаря этому все интегралы в коде сводятся к скалярной $G$ --- вычислительно эффективно и без потери физики.
+
 
 \subsection{PMCHWT-формулировка}
 
