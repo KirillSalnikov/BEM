@@ -1,0 +1,109 @@
+#ifndef BEM_BEM_FMM_H
+#define BEM_BEM_FMM_H
+
+#include "types.h"
+#include "fmm.h"
+#include "rwg.h"
+#include "mesh.h"
+#include "quadrature.h"
+#include <complex>
+#include <vector>
+
+struct BemFmmOperator {
+    int N;             // number of RWG basis functions
+    int Nq;            // quad points per triangle
+    int system_size;   // 2*N
+
+    cdouble k_ext, k_int;
+    cdouble eta_ext, eta_int;
+
+    // FMM engines (one per wavenumber)
+    HelmholtzFMM fmm_ext;
+    HelmholtzFMM fmm_int;
+    bool shared_fmm;  // true if k_ext ≈ k_int
+
+    // Precomputed quadrature data
+    // quad points: (N, Nq, 3) for plus/minus halves
+    std::vector<double> qpts_p;   // (N*Nq*3) flat
+    std::vector<double> qpts_m;
+
+    // RWG basis values: (N, Nq, 3)
+    std::vector<double> f_p;      // (N*Nq*3) flat
+    std::vector<double> f_m;
+
+    // Divergences: (N)
+    std::vector<double> div_p;
+    std::vector<double> div_m;
+
+    // Jacobian × weights: (N, Nq)
+    std::vector<double> jw_p;
+    std::vector<double> jw_m;
+
+    // All quad points flat for FMM: (2*N*Nq, 3)
+    std::vector<double> all_pts;
+
+    // Singular correction matrices in sparse CSR format
+    // All 4 matrices share the same sparsity pattern (same-triangle RWG pairs)
+    std::vector<int> corr_row_ptr;       // (N+1)
+    std::vector<int> corr_col_idx;       // (nnz)
+    std::vector<cdouble> corr_L_ext_val; // (nnz)
+    std::vector<cdouble> corr_K_ext_val;
+    std::vector<cdouble> corr_L_int_val;
+    std::vector<cdouble> corr_K_int_val;
+    int corr_nnz;
+
+    // Pre-allocated temporary buffers for matvec (avoid malloc/free per iteration)
+    std::vector<cdouble> tmp_src_charges;   // (2*N*Nq) — source charges for FMM
+    std::vector<cdouble> tmp_phi;           // (2*N*Nq) — FMM potential result
+    std::vector<cdouble> tmp_grad[3];       // (2*N*Nq*3) each — FMM gradient results
+    std::vector<cdouble> tmp_L_result;      // (N) — L operator result buffer
+    std::vector<cdouble> tmp_K_result;      // (N) — K operator result buffer
+    // Matvec output buffers: L/K × ext/int × J/M
+    std::vector<cdouble> mv_L_ext_J, mv_L_ext_M, mv_K_ext_J, mv_K_ext_M;
+    std::vector<cdouble> mv_L_int_J, mv_L_int_M, mv_K_int_J, mv_K_int_M;
+
+    // Batch-2 workspace
+    std::vector<cdouble> tmp2_src_charges;
+    std::vector<cdouble> tmp2_phi;
+    std::vector<cdouble> tmp2_grad[3];
+    std::vector<cdouble> mv2_L_ext_J, mv2_L_ext_M, mv2_K_ext_J, mv2_K_ext_M;
+    std::vector<cdouble> mv2_L_int_J, mv2_L_int_M, mv2_K_int_J, mv2_K_int_M;
+
+    // Initialize operator
+    void init(const RWG& rwg, const Mesh& mesh,
+              cdouble k_ext, cdouble k_int,
+              double eta_ext, double eta_int,
+              int quad_order = 7, int fmm_digits = 3, int max_leaf = 64);
+
+    // Apply PMCHWT system: y = Z * x, where x and y are (2*N) vectors
+    void matvec(const cdouble* x, cdouble* y);
+
+    // Batched matvec: y1 = Z*x1, y2 = Z*x2
+    void matvec_batch2(const cdouble* x1, const cdouble* x2, cdouble* y1, cdouble* y2);
+
+    // Cleanup FMM resources
+    void cleanup();
+
+private:
+    // Apply L operator via FMM: result = L(k) * x
+    void L_operator(const cdouble* x, cdouble k, HelmholtzFMM& fmm, cdouble* result);
+
+    // Apply K operator via FMM: result = K(k) * x
+    void K_operator(const cdouble* x, cdouble k, HelmholtzFMM& fmm, cdouble* result);
+
+    // Combined L+K operator: single FMM tree pass per vector component
+    // Computes both L(k)*x and K(k)*x using evaluate_pot_grad
+    void LK_combined(const cdouble* x, cdouble k, HelmholtzFMM& fmm,
+                     cdouble* L_result, cdouble* K_result);
+
+    // Batched combined L+K for two RHS vectors
+    void LK_combined_batch2(const cdouble* x1, const cdouble* x2,
+                             cdouble kv, HelmholtzFMM& fmm,
+                             cdouble* L_result1, cdouble* K_result1,
+                             cdouble* L_result2, cdouble* K_result2);
+
+    // Precompute singular corrections
+    void precompute_corrections(const RWG& rwg, const Mesh& mesh, int quad_order);
+};
+
+#endif // BEM_BEM_FMM_H
